@@ -239,7 +239,7 @@ namespace mongo {
                         continue;
                     }
                     CurOp *op = client->curop();
-                    if (op && op->isStarted() && op->displayInCurop()) {
+                    if (op && *op->getNS() && op->isStarted() && op->displayInCurop()) {
                         const long long ms = op->elapsedMillis();
                         if (ms >= curOpAlarmMillis) {
                             warning() << "op taking a long time, aborting: "
@@ -250,6 +250,8 @@ namespace mongo {
                         }
                     }
                 }
+            }
+            if (curOpAlarmMillis > 0) {
                 usleep(2000); // tight 2ms poll when alarm is set
             } else {
                 sleepsecs(2); // 2 second poll when no alarm is set
