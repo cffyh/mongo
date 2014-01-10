@@ -1,10 +1,11 @@
 Name: tokumx
-Conflicts: mongo, mongo-10gen, mongo-10gen-unstable
-Obsoletes: mongo-stable
+Conflicts: mongo, mongo-10gen, mongo-10gen-unstable, mongo-stable
+Requires: tokumx-libs
 Version: 1.3.3
-Release: tokumx_1%{?dist}
+Release: 1%{?dist}
 Summary: tokumx client shell and tools
-License: AGPL 3.0, GPL 2.0, custom
+License: AGPLv3 and GPLv2
+Vendor: Tokutek, Inc.
 URL: http://www.tokutek.com/products/tokumx-for-mongodb
 Group: Applications/Databases
 
@@ -20,10 +21,20 @@ and auto-sharding.
 This package provides the mongo shell, import/export tools, and other
 client utilities.
 
-%package server
-Summary: mongo server, sharding server, and support scripts
+%package libs
+Summary: tokumx shared libraries
 Group: Applications/Databases
-Requires: tokumx
+
+%description libs
+Mongo (from "huMONGOus") is a schema-free document-oriented database.
+
+This package provides the libraries shared among the server and tools,
+including a portability layer and the Fractal Tree indexing library.
+
+%package server
+Summary: tokumx server, sharding server, and support scripts
+Group: Applications/Databases
+Requires: tokumx-libs
 
 %description server
 Mongo (from "huMONGOus") is a schema-free document-oriented database.
@@ -58,6 +69,7 @@ mkdir -p opt
     -D USE_BDB=OFF \
     -D USE_SYSTEM_BOOST=OFF \
     -D USE_SYSTEM_PCRE=ON \
+    -D TOKUMX_STRIP_BINARIES=OFF \
     -D TOKUMX_SET_RPATH=OFF \
     -D CMAKE_INSTALL_PREFIX=$RPM_BUILD_ROOT/usr \
     -D BUILD_TESTING=OFF \
@@ -173,6 +185,8 @@ fi
 %{_defaultdocdir}/%{name}/NEWS
 %{_datadir}/%{name}/scripts/tokumxstat.py*
 
+%files libs
+%defattr(-,root,root,-)
 /usr/lib64/tokumx/libHotBackup.so
 /usr/lib64/tokumx/libtokufractaltree.so
 /usr/lib64/tokumx/libtokuportability.so
