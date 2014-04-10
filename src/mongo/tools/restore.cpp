@@ -66,6 +66,7 @@ public:
         ("noOptionsRestore" , "don't restore collection options")
         ("noIndexRestore" , "don't restore indexes")
         ("w" , po::value<int>()->default_value(0) , "minimum number of replicas per write. WARNING, setting w > 1 prevents the bulk load optimization." )
+        ("noLoader", "don't use bulk loader")
         ;
         add_hidden_options()
         ("dir", po::value<string>()->default_value("dump"), "directory to restore from")
@@ -101,6 +102,9 @@ public:
         _doBulkLoad = _w <= 1;
         if (!_doBulkLoad) {
             log() << "warning: not using bulk loader due to --w > 1" << endl;
+        }
+        if (hasParam( "noLoader" )) {
+            _doBulkLoad = false;
         }
         if (hasParam( "keepIndexVersion" )) {
             log() << "warning: --keepIndexVersion is deprecated in TokuMX" << endl;
@@ -279,7 +283,11 @@ public:
         if (_doBulkLoad) {
             RemoteLoader loader(conn(), _curdb, _curcoll, indexes, options);
             processFile( root );
-            loader.commit();
+            BSONObj res;
+            bool ok = loader.commit(&res);
+            if (!ok) {
+                error() << "Error committing load for " << _curdb << "." << _curcoll << ": " << res << endl;
+            }
         } else {
             // No bulk load. Create collection and indexes manually.
             if (!options.isEmpty()) {
@@ -317,7 +325,6 @@ public:
 
             // wait for insert to propagate to "w" nodes (doesn't warn if w used without replset)
             if ( _w > 0 ) {
-                verify( !_doBulkLoad );
                 string err = conn().getLastError(_curdb, false, false, _w);
                 if (!err.empty()) {
                     error() << err;
@@ -362,34 +369,29 @@ private:
         return nfields == obj2.nFields();
     }
 
-    void createCollectionWithOptions(BSONObj cmdObj) {
+    void createCollectionWithOptions(BSONObj obj) {
+        BSONObjIterator i(obj);
 
-        // Create a new cmdObj to skip undefined fields and fix collection name
+        // Rebuild obj as a command object for the "create" command.
+        // - {create: <name>} comes first, where <name> is the new name for the collection
+        // - elements with type Undefined get skipped over
         BSONObjBuilder bo;
-
-        // Add a "create" field if it doesn't exist
-        if (!cmdObj.hasField("create")) {
-            bo.append("create", _curcoll);
-        }
-
-        BSONObjIterator i(cmdObj);
-        while ( i.more() ) {
+        bo.append("create", _curcoll);
+        while (i.more()) {
             BSONElement e = i.next();
 
-            // Replace the "create" field with the name of the collection we are actually creating
             if (strcmp(e.fieldName(), "create") == 0) {
-                bo.append("create", _curcoll);
+                continue;
             }
-            else {
-                if (e.type() == Undefined) {
-                    log() << _curns << ": skipping undefined field: " << e.fieldName() << endl;
-                }
-                else {
-                    bo.append(e);
-                }
+
+            if (e.type() == Undefined) {
+                log() << _curns << ": skipping undefined field: " << e.fieldName() << endl;
+                continue;
             }
+
+            bo.append(e);
         }
-        cmdObj = bo.obj();
+        obj = bo.obj();
 
         BSONObj fields = BSON("options" << 1);
         scoped_ptr<DBClientCursor> cursor(conn().query(_curdb + ".system.namespaces", Query(BSON("name" << _curns)), 0, 0, &fields));
@@ -397,8 +399,8 @@ private:
         bool createColl = true;
         if (cursor->more()) {
             createColl = false;
-            BSONObj obj = cursor->next();
-            if (!obj.hasField("options") || !optionsSame(cmdObj, obj["options"].Obj())) {
+            BSONObj nsObj = cursor->next();
+            if (!nsObj.hasField("options") || !optionsSame(obj, nsObj["options"].Obj())) {
                     log() << "WARNING: collection " << _curns << " exists with different options than are in the metadata.json file and not using --drop. Options in the metadata file will be ignored." << endl;
             }
         }
@@ -408,10 +410,10 @@ private:
         }
 
         BSONObj info;
-        if (!conn().runCommand(_curdb, cmdObj, info)) {
+        if (!conn().runCommand(_curdb, obj, info)) {
             uasserted(15936, "Creating collection " + _curns + " failed. Errmsg: " + info["errmsg"].String());
         } else {
-            log() << "\tCreated collection " << _curns << " with options: " << cmdObj.jsonString() << endl;
+            log() << "\tCreated collection " << _curns << " with options: " << obj.jsonString() << endl;
         }
     }
 

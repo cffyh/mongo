@@ -84,37 +84,39 @@ namespace mongo {
             }
         }
 
+        static BSONObj pretty_key(const DBT *key, DB *db);
+
+        static void runUpdateMods(DB *db, const DBT *key, const DBT *old_val, const BSONObj& updateObj,
+                                   void (*set_val)(const DBT *new_val, void *set_extra),
+                                   void *set_extra) {
+            uassert(17315, "Got an empty old_val or old_val->data in runUpdateMods, should not happen", old_val && old_val->data);
+            // Apply the update mods
+            const BSONObj oldObj(reinterpret_cast<char *>(old_val->data));
+            BSONObj newObj = _updateCallback->applyMods(oldObj, updateObj);
+            // Set the new value
+            DBT new_val = dbt_make(newObj.objdata(), newObj.objsize());
+            set_val(&new_val, set_extra);
+        }
+
         static int update_callback(DB *db, const DBT *key, const DBT *old_val, const DBT *extra,
                                    void (*set_val)(const DBT *new_val, void *set_extra),
                                    void *set_extra) {
             try {
                 verify(_updateCallback != NULL);
                 verify(key != NULL && extra != NULL && extra->data != NULL);
-
-                BSONObj newObj;
                 const BSONObj msg(static_cast<char *>(extra->data));
-                if (old_val == NULL || old_val->data == NULL) {
-                    const DBT *desc = &db->cmp_descriptor->dbt;
-                    verify(desc->data != NULL);
-                    Descriptor descriptor(reinterpret_cast<const char *>(desc->data), desc->size);
-
-                    // Old object did not exist - create a new one via upsert.
-                    // The stored pk does not have field names, add them here.
-                    const Key sPK(key);
-                    const BSONObj pkWithFieldNames = descriptor.fillKeyFieldNames(sPK.key());
-                    newObj = _updateCallback->upsert(pkWithFieldNames, msg);
-                } else {
-                    // Apply the update mods
-                    const BSONObj oldObj(reinterpret_cast<char *>(old_val->data));
-                    newObj = _updateCallback->applyMods(oldObj, msg);
-                }
-                // Set the new value
-                DBT new_val = dbt_make(newObj.objdata(), newObj.objsize());
-                set_val(&new_val, set_extra);
+                const char* type = msg[ "t" ].valuestrsafe();
+                // right now, we only support one type of message, an updateMods
+                uassert(17313, str::stream() << "unknown type of update message, type: " << type << " message: " << msg, strcmp(type, "u") == 0);
+                const BSONObj updateObj = msg["o"].Obj();
+                runUpdateMods(db, key, old_val, updateObj, set_val, set_extra);
                 return 0;
-            } catch (const std::exception &ex) { 
-                problem() << "Caught exception in ydb update callback, cannot proceed: " 
-                          << ex.what() << endl;
+            } catch (const std::exception &ex) {
+                problem() << "Caught exception in ydb update callback, ex: " << ex.what()
+                          << "key: " << (key != NULL ? pretty_key(key, db) : BSONObj())
+                          << "oldObj: " << (old_val != NULL ? BSONObj(static_cast<char *>(old_val->data)) : BSONObj())
+                          << "msg: " << (extra != NULL ? BSONObj(static_cast<char *>(extra->data)) : BSONObj())
+                          << endl;
                 fassertFailed(17215);
             }
             return -1;
@@ -228,7 +230,8 @@ namespace mongo {
         }
 
         static void tokudb_print_error(const DB_ENV * db_env, const char *db_errpfx, const char *buffer) {
-            tokulog() << db_errpfx << ": " << buffer << endl;
+            // We may be calling this from a crashing state, so we should use rawOut.
+            rawOut(buffer);
         }
 
         // Called by the ydb to determine how long a txn should sleep on a lock.
@@ -522,6 +525,14 @@ namespace mongo {
                             }
                         }
                         break;
+                    case DOUBLE:
+                        {
+                            double v = row->value.dnum;
+                            if (ifZero || v != 0) {
+                                result.appendNumber(field, v);
+                            }
+                        }
+                        break;
                     default:
                         {
                             StringBuilder s;
@@ -548,6 +559,47 @@ namespace mongo {
                         break;
                     }
                 }
+            }
+
+            uint64_t getInteger(const StringData &key) const {
+                for (uint64_t i = 0; i < _num_rows; ++i) {
+                    TOKU_ENGINE_STATUS_ROW row = &_rows[i];
+                    if (key == row->keyname) {
+                        switch (row->type) {
+                        case FS_STATE:
+                        case UINT64:
+                            return row->value.num;
+                        case PARCOUNT:
+                            return read_partitioned_counter(row->value.parcount);
+                        case DOUBLE:
+                        case CHARSTR:
+                        case UNIXTIME:
+                        case TOKUTIME:
+                            msgasserted(17289, "wrong engine status type for getInteger");
+                        }
+                    }
+                }
+                msgasserted(17290, mongoutils::str::stream() << "no such key: " << key);
+            }
+
+            double getDuration(const StringData &key) const {
+                for (uint64_t i = 0; i < _num_rows; ++i) {
+                    TOKU_ENGINE_STATUS_ROW row = &_rows[i];
+                    if (key == row->keyname) {
+                        switch (row->type) {
+                        case TOKUTIME:
+                            return tokutime_to_seconds(row->value.num);
+                        case DOUBLE:
+                        case CHARSTR:
+                        case UNIXTIME:
+                        case FS_STATE:
+                        case UINT64:
+                        case PARCOUNT:
+                            msgasserted(17291, "wrong engine status type for getDuration");
+                        }
+                    }
+                }
+                msgasserted(17292, mongoutils::str::stream() << "no such key: " << key);
             }
         };
 
@@ -614,8 +666,97 @@ namespace mongo {
                     }
                     {
                         BSONObjBuilder b2(b.subobjStart("miss"));
-                        status.appendInfo(b2, "count", "CT_MISS", true);
-                        status.appendInfo(b2, "time", "CT_MISSTIME", true);
+                        uint64_t fullMisses = status.getInteger("CT_MISS");
+                        // unfortunately, this is a uint64 when it's actually a tokutime...
+                        double fullMisstime = tokutime_to_seconds(status.getInteger("CT_MISSTIME"));
+                        uint64_t partialMisses = 0;
+                        double partialMisstime = 0.0;
+                        const char *partialMissKeys[] = {"FT_NUM_BASEMENTS_FETCHED_NORMAL",
+                                                         "FT_NUM_BASEMENTS_FETCHED_AGGRESSIVE",
+                                                         "FT_NUM_BASEMENTS_FETCHED_PREFETCH",
+                                                         "FT_NUM_BASEMENTS_FETCHED_WRITE",
+                                                         "FT_NUM_MSG_BUFFER_FETCHED_NORMAL",
+                                                         "FT_NUM_MSG_BUFFER_FETCHED_AGGRESSIVE",
+                                                         "FT_NUM_MSG_BUFFER_FETCHED_PREFETCH",
+                                                         "FT_NUM_MSG_BUFFER_FETCHED_WRITE"};
+                        const char *partialMisstimeKeys[] = {"FT_TOKUTIME_BASEMENTS_FETCHED_NORMAL",
+                                                             "FT_TOKUTIME_BASEMENTS_FETCHED_AGGRESSIVE",
+                                                             "FT_TOKUTIME_BASEMENTS_FETCHED_PREFETCH",
+                                                             "FT_TOKUTIME_BASEMENTS_FETCHED_WRITE",
+                                                             "FT_TOKUTIME_MSG_BUFFER_FETCHED_NORMAL",
+                                                             "FT_TOKUTIME_MSG_BUFFER_FETCHED_AGGRESSIVE",
+                                                             "FT_TOKUTIME_MSG_BUFFER_FETCHED_PREFETCH",
+                                                             "FT_TOKUTIME_MSG_BUFFER_FETCHED_WRITE"};
+                        dassert((sizeof partialMissKeys) == (sizeof partialMisstimeKeys));
+                        for (size_t i = 0; i < (sizeof partialMissKeys) / (sizeof partialMissKeys[0]); ++i) {
+                            partialMisses += status.getInteger(partialMissKeys[i]);
+                            partialMisstime += status.getDuration(partialMisstimeKeys[i]);
+                        }
+
+                        b2.append("count", fullMisses + partialMisses);
+                        b2.append("time", fullMisstime + partialMisstime);
+                        {
+                            BSONObjBuilder b3(b2.subobjStart("full"));
+                            b3.append("count", fullMisses);
+                            b3.append("time", fullMisstime);
+                            b3.doneFast();
+                        }
+                        {
+                            BSONObjBuilder b3(b2.subobjStart("partial"));
+                            b3.append("count", partialMisses);
+                            b3.append("time", partialMisstime);
+                            b3.doneFast();
+                        }
+                        b2.doneFast();
+                    }
+                    {
+                        BSONObjBuilder b2(b.subobjStart("evictions"));
+                        {
+                            BSONObjBuilder b3(b.subobjStart("partial"));
+                            {
+                                BSONObjBuilder b4(b.subobjStart("nonleaf"));
+                                status.appendInfo(b4, "count", "FT_PARTIAL_EVICTIONS_NONLEAF", true);
+                                status.appendInfo(b4, "bytes", "FT_PARTIAL_EVICTIONS_NONLEAF_BYTES", true, scale);
+                                b4.doneFast();
+                            }
+                            {
+                                BSONObjBuilder b4(b.subobjStart("leaf"));
+                                status.appendInfo(b4, "count", "FT_PARTIAL_EVICTIONS_LEAF", true);
+                                status.appendInfo(b4, "bytes", "FT_PARTIAL_EVICTIONS_LEAF_BYTES", true, scale);
+                                b4.doneFast();
+                            }
+                            b3.doneFast();
+                        }
+                        {
+                            BSONObjBuilder b3(b.subobjStart("full"));
+                            {
+                                BSONObjBuilder b4(b.subobjStart("nonleaf"));
+                                status.appendInfo(b4, "count", "FT_FULL_EVICTIONS_NONLEAF", true);
+                                status.appendInfo(b4, "bytes", "FT_FULL_EVICTIONS_NONLEAF_BYTES", true);
+                                {
+                                    BSONObjBuilder b5(b.subobjStart("dirty"));
+                                    status.appendInfo(b5, "count", "FT_DISK_FLUSH_NONLEAF", true);
+                                    status.appendInfo(b5, "bytes", "FT_DISK_FLUSH_NONLEAF_UNCOMPRESSED_BYTES", true, scale);
+                                    status.appendInfo(b5, "time", "FT_DISK_FLUSH_NONLEAF_TOKUTIME", true);
+                                    b5.doneFast();
+                                }
+                                b4.doneFast();
+                            }
+                            {
+                                BSONObjBuilder b4(b.subobjStart("leaf"));
+                                status.appendInfo(b4, "count", "FT_FULL_EVICTIONS_LEAF", true);
+                                status.appendInfo(b4, "bytes", "FT_FULL_EVICTIONS_LEAF_BYTES", true);
+                                {
+                                    BSONObjBuilder b5(b.subobjStart("dirty"));
+                                    status.appendInfo(b5, "count", "FT_DISK_FLUSH_LEAF", true);
+                                    status.appendInfo(b5, "bytes", "FT_DISK_FLUSH_LEAF_UNCOMPRESSED_BYTES", true, scale);
+                                    status.appendInfo(b5, "time", "FT_DISK_FLUSH_LEAF_TOKUTIME", true);
+                                    b5.doneFast();
+                                }
+                                b4.doneFast();
+                            }
+                            b3.doneFast();
+                        }
                         b2.doneFast();
                     }
                     {
@@ -637,6 +778,7 @@ namespace mongo {
                         status.appendInfo(b2, "limit", "LTM_SIZE_LIMIT", true, scale);
                         b2.doneFast();
                     }
+                    status.appendInfo(b, "requestsPending", "LTM_LOCK_REQUESTS_PENDING", false);
                     {
                         BSONObjBuilder lwb;
                         status.appendInfo(lwb, "count", "LTM_LONG_WAIT_COUNT", false);
@@ -655,6 +797,13 @@ namespace mongo {
                             b.append("longWaitEscalation", lw);
                         }
                     }
+                    b.doneFast();
+                }
+                {
+                    BSONObjBuilder b(result.subobjStart("compressionRatio"));
+                    status.appendInfo(b, "leaf", "FT_DISK_FLUSH_LEAF_COMPRESSION_RATIO", true);
+                    status.appendInfo(b, "nonleaf", "FT_DISK_FLUSH_NONLEAF_COMPRESSION_RATIO", true);
+                    status.appendInfo(b, "overall", "FT_DISK_FLUSH_OVERALL_COMPRESSION_RATIO", true);
                     b.doneFast();
                 }
 
@@ -731,21 +880,18 @@ namespace mongo {
             }
         }
 
-        void get_pending_lock_request_status(BSONObjBuilder &status) {
+        void get_pending_lock_request_status(vector<BSONObj> &pendingLockRequests) {
             struct iterate_lock_requests : public ExceptionSaver {
-                iterate_lock_requests() { }
+                vector<BSONObj> &_reqs;
+              public:
+                iterate_lock_requests(vector<BSONObj> &reqs) : _reqs(reqs) { }
                 static int callback(DB *db, uint64_t requesting_txnid,
                                     const DBT *left_key, const DBT *right_key,
                                     uint64_t blocking_txnid, uint64_t start_time,
                                     void *extra) {
                     iterate_lock_requests *info = reinterpret_cast<iterate_lock_requests *>(extra);
                     try {
-                        if (info->array.len() + left_key->size + right_key->size > BSONObjMaxUserSize - 1024) {
-                            // We're running out of space, better stop here.
-                            info->array.append("too many results to return");
-                            return ERANGE;
-                        }
-                        BSONObjBuilder status(info->array.subobjStart());
+                        BSONObjBuilder status;
                         status.append("index", get_index_name(db));
                         status.appendNumber("requestingTxnid", requesting_txnid);
                         status.appendNumber("blockingTxnid", blocking_txnid);
@@ -755,26 +901,26 @@ namespace mongo {
                             pretty_bounds(db, left_key, right_key, bounds);
                             bounds.done();
                         }
-                        status.done();
+                        info->_reqs.push_back(status.obj());
                         return 0;
                     } catch (const std::exception &ex) {
                         info->saveException(ex);
                     }
                     return -1;
                 }
-                BSONArrayBuilder array;
-            } e;
+            } e(pendingLockRequests);
             const int r = env->iterate_pending_lock_requests(env, iterate_lock_requests::callback, &e);
-            if (r != 0 && r != ERANGE) {
+            if (r != 0) {
                 e.throwException();
                 handle_ydb_error(r);
             }
-            status.appendArray("requests", e.array.done());
         }
 
-        void get_live_transaction_status(BSONObjBuilder &status) {
-            struct iterate_transactions : public ExceptionSaver {
-                iterate_transactions() { }
+        void get_live_transaction_status(vector<BSONObj> &liveTransactions) {
+            class iterate_transactions : public ExceptionSaver {
+                vector<BSONObj> &_txns;
+              public:
+                iterate_transactions(vector<BSONObj> &txns) : _txns(txns) { }
                 static int callback(uint64_t txnid, uint64_t client_id,
                                     iterate_row_locks_callback iterate_locks,
                                     void *locks_extra, void *extra) {
@@ -782,7 +928,7 @@ namespace mongo {
                     try {
                         // We ignore client_id because txnid is sufficient for finding
                         // the associated operation in db.currentOp()
-                        BSONObjBuilder status(info->array.subobjStart());
+                        BSONObjBuilder status;
                         status.appendNumber("txnid", txnid);
                         BSONArrayBuilder locks(status.subarrayStart("rowLocks"));
                         {
@@ -803,27 +949,19 @@ namespace mongo {
                             }
                             locks.done();
                         }
-                        status.done();
-                        if (info->array.len() > BSONObjMaxUserSize - 1024) {
-                            // We're running out of space, better stop here.
-                            locks.append("too many results to return");
-                            return ERANGE;
-                        }
+                        info->_txns.push_back(status.obj());
                         return 0;
                     } catch (const std::exception &ex) {
                         info->saveException(ex);
                     }
                     return -1;
                 }
-                BSONArrayBuilder array;
-            } e;
+            } e(liveTransactions);
             const int r = env->iterate_live_transactions(env, iterate_transactions::callback, &e);
-            if (r != 0 && r != ERANGE) {
+            if (r != 0) {
                 e.throwException();
                 handle_ydb_error(r);
             }
-            status.appendArray("transactions", e.array.done());
-
         }
 
         void log_flush() {
@@ -849,7 +987,7 @@ namespace mongo {
 
           protected:
             virtual Status validate(const uint32_t& period) {
-                if (period < 0 || period > 500) {
+                if (static_cast<int32_t>(period) < 0 || period > 500) {
                     return Status(ErrorCodes::BadValue, "logFlushPeriod must be between 0 and 500 ms");
                 }
                 env->change_fsync_log_period(env, period);
@@ -862,7 +1000,7 @@ namespace mongo {
             CheckpointPeriodParameter() : ExportedServerParameter<uint32_t>(ServerParameterSet::getGlobal(), "checkpointPeriod", &cmdLine.checkpointPeriod, true, true) {}
 
             virtual Status validate(const uint32_t &period) {
-                if (period < 0) {
+                if (static_cast<int32_t>(period) < 0) {
                     return Status(ErrorCodes::BadValue, "checkpointPeriod must be greater than 0s");
                 }
                 int r = env->checkpointing_set_period(env, period);
@@ -879,7 +1017,7 @@ namespace mongo {
             CleanerPeriodParameter() : ExportedServerParameter<uint32_t>(ServerParameterSet::getGlobal(), "cleanerPeriod", &cmdLine.cleanerPeriod, true, true) {}
 
             virtual Status validate(const uint32_t &period) {
-                if (period < 0) {
+                if (static_cast<int32_t>(period) < 0) {
                     return Status(ErrorCodes::BadValue, "cleanerPeriod must be greater than 0s");
                 }
                 int r = env->cleaner_set_period(env, period);
@@ -896,7 +1034,7 @@ namespace mongo {
             CleanerIterationsParameter() : ExportedServerParameter<uint32_t>(ServerParameterSet::getGlobal(), "cleanerIterations", &cmdLine.cleanerIterations, true, true) {}
 
             virtual Status validate(const uint32_t &iterations) {
-                if (iterations < 0) {
+                if (static_cast<int32_t>(iterations) < 0) {
                     return Status(ErrorCodes::BadValue, "cleanerIterations must be greater than 0");
                 }
                 int r = env->cleaner_set_iterations(env, iterations);
@@ -1032,6 +1170,10 @@ namespace mongo {
             fassertFailed(16853);
         }
     
+        void do_backtrace() {
+            env->do_backtrace(env);
+        }
+
     } // namespace storage
 
 } // namespace mongo

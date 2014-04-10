@@ -74,9 +74,9 @@ namespace mongo {
             if (onInitiate) {
                 cc().txn().txnIntiatingRs();
             }
-            updateObjects(rsConfigNs.c_str(), asBson(), BSONObj(), true, false, true);
+            updateObjects(rsConfigNs.c_str(), asBson(), BSONObj(), true, false);
             if( !comment.isEmpty() && (!theReplSet || theReplSet->isPrimary()) ) {
-                OpLogHelpers::logComment(comment);
+                OplogHelpers::logComment(comment);
             }
             transaction.commit(0);
         }
@@ -180,6 +180,8 @@ namespace mongo {
     const int ReplSetConfig::CURRENT_PROTOCOL_VERSION = PV_TOKUMX_CURRENT;
     const int ReplSetConfig::MAX_SUPPORTED_PROTOCOL_VERSION = PV_TOKUMX_CURRENT;
     const int ReplSetConfig::MIN_SUPPORTED_PROTOCOL_VERSION = PV_TOKUMX_1_0;
+
+    uint32_t ReplSetConfig::OPLOG_VERSION = OPLOG_VERSION_CURRENT;
 
     BOOST_STATIC_ASSERT(ReplSetConfig::MIN_SUPPORTED_PROTOCOL_VERSION > PV_MONGODB_CURRENT);
     BOOST_STATIC_ASSERT(ReplSetConfig::MIN_SUPPORTED_PROTOCOL_VERSION <= ReplSetConfig::MAX_SUPPORTED_PROTOCOL_VERSION);

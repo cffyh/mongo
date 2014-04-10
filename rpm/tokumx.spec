@@ -1,10 +1,15 @@
-%global daemon tokumx
+%global product_name tokumx
 
+%if 0%{tokumx_enterprise}
+Name: tokumx-enterprise
+Obsoletes: mongo, mongo-10gen, mongo-10gen-unstable, mongo-stable, mongodb, mongodb-server, tokumx
+%else
 Name: tokumx
-Conflicts: mongo, mongo-10gen, mongo-10gen-unstable, mongo-stable, mongodb, mongodb-server
-Requires: tokumx-common
-Version: 1.4.0
-Release: alpha.1%{?dist}
+Obsoletes: mongo, mongo-10gen, mongo-10gen-unstable, mongo-stable, mongodb, mongodb-server
+Conflicts: tokumx-enterprise
+%endif
+Version: %{?tokumx_version}%{!?tokumx_version:1.4.0}
+Release: %{?tokumx_rpm_release_version}%{!?tokumx_rpm_release_version:1}%{?dist}
 Summary: TokuMX client shell and tools
 License: AGPLv3 and zlib and ASL 2.0 and GPLv2
 Vendor: Tokutek, Inc.
@@ -12,22 +17,23 @@ URL: http://www.tokutek.com/products/tokumx-for-mongodb
 Group: Applications/Databases
 
 Source0: %{name}-%{version}.tar.gz
-Source1: %{name}.init
-Source2: %{name}.logrotate
-Source3: %{name}.conf
-Source4: %{daemon}.sysconf
-Source5: %{name}-tmpfile
-Source6: %{daemon}.service
+Source1: %{product_name}.init
+Source2: %{product_name}.logrotate
+Source3: %{product_name}.conf
+Source4: %{product_name}.sysconf
+Source5: %{product_name}-tmpfile
+Source6: %{product_name}.service
 
 %if 0%{?fedora} >= 15
 BuildRequires: boost-devel
 %endif
-BuildRequires: pcre-devel
 BuildRequires: readline-devel
 BuildRequires: libpcap-devel
 %if 0%{?fedora} >= 15
 BuildRequires: systemd
 %endif
+Requires: %{name}-common = %{version}-%{release}
+
 
 %description
 TokuMX is a high-performance version of MongoDB using Fractal
@@ -48,6 +54,11 @@ client utilities.
 %package common
 Summary: TokuMX common files
 Group: Applications/Databases
+%if 0%{tokumx_enterprise}
+Obsoletes: tokumx-common
+%else
+Conflicts: tokumx-enterprise-common
+%endif
 
 %description common
 TokuMX is a high-performance version of MongoDB using Fractal
@@ -59,7 +70,7 @@ including a portability layer and the Fractal Tree indexing library.
 %package server
 Summary: tokumx server, sharding server, and support scripts
 Group: Applications/Databases
-Requires: tokumx-common
+Requires: %{name}-common = %{version}-%{release}
 Requires(pre): shadow-utils
 %if 0%{?fedora} >= 15
 Requires(post): systemd-units
@@ -70,6 +81,11 @@ Requires(post): chkconfig
 Requires(preun): chkconfig
 Requires(postun): initscripts
 %endif
+%if 0%{tokumx_enterprise}
+Obsoletes: tokumx-server
+%else
+Conflicts: tokumx-enterprise-server
+%endif
 
 %description server
 TokuMX is a high-performance version of MongoDB using Fractal
@@ -78,16 +94,41 @@ Tree indexes to store indexes and data.
 This package provides the mongo server software, mongo sharding server
 softwware, default configuration files, and init.d scripts.
 
-%package devel
-Summary: Headers and libraries for mongo development. 
-Group: Applications/Databases
+%package -n lib%{name}
+Summary: TokuMX shared libraries
+Group: Development/Libraries
+Requires: %{name}-common = %{version}-%{release}
+%if 0%{tokumx_enterprise}
+Obsoletes: libtokumx libmongodb
+%else
+Conflicts: libtokumx-enterprise
+Obsoletes: libmongodb
+%endif
 
-%description devel
+%description -n lib%{name}
 TokuMX is a high-performance version of MongoDB using Fractal
 Tree indexes to store indexes and data.
 
-This package provides the mongo static library and header files needed
-to develop tokumx client software.
+This package provides the shared library for the TokuMX client.
+
+%package -n lib%{name}-devel
+Summary: TokuMX header files
+Group: Development/Libraries
+Requires: lib%{name} = %{version}-%{release}
+Requires: boost-devel
+Provides: tokumx-devel = %{version}-%{release}
+%if 0%{tokumx_enterprise}
+Obsoletes: libtokumx-devel libmongodb-devel mongodb-devel
+%else
+Conflicts: libtokumx-enterprise
+Obsoletes: libmongodb-devel mongodb-devel
+%endif
+
+%description -n lib%{name}-devel
+TokuMX is a high-performance version of MongoDB using Fractal
+Tree indexes to store indexes and data.
+
+This package provides the header files and C++ driver for TokuMX.
 
 %prep
 %setup
@@ -112,13 +153,20 @@ mkdir -p opt
 %else
     -D USE_SYSTEM_BOOST=OFF \
 %endif
-    -D USE_SYSTEM_PCRE=ON \
+    -D USE_SYSTEM_PCRE=OFF \
     -D TOKUMX_STRIP_BINARIES=OFF \
     -D TOKUMX_SET_RPATH=OFF \
     -D CMAKE_INSTALL_PREFIX=%{buildroot}/%{_prefix} \
     -D BUILD_TESTING=OFF \
-    -D INSTALL_LIBDIR=%{_lib}/%{name} \
-    -D CMAKE_INSTALL_RPATH=%{_libdir}/%{name} \
+    -D INSTALL_LIBDIR=%{_lib}/%{product_name} \
+    -D CMAKE_INSTALL_RPATH=%{_libdir}/%{product_name} \
+    -D TOKUMX_CLIENT_LIB_SHARED=ON \
+%if 0%{?tokumx_revision:1}
+    -D TOKUMX_GIT_VERSION=%{tokumx_revision} \
+%endif
+%if 0%{?tokukv_revision:1}
+    -D TOKUKV_GIT_VERSION=%{tokukv_revision} \
+%endif
     ..)
 make -C opt %{?_smp_mflags}
 
@@ -129,54 +177,59 @@ make -C opt %{?_smp_mflags}
   cmake -D COMPONENT=tokumx_tools -P cmake_install.cmake && \
   cmake -D COMPONENT=tokumx_plugins -P cmake_install.cmake && \
   cmake -D COMPONENT=tokukv_libs_shared -P cmake_install.cmake && \
-  cmake -D COMPONENT=tokubackup_libs_shared -P cmake_install.cmake)
+  cmake -D COMPONENT=tokubackup_libs_shared -P cmake_install.cmake && \
+  cmake -D COMPONENT=tokumx_client_headers -P cmake_install.cmake && \
+  cmake -D COMPONENT=tokumx_client_libs -P cmake_install.cmake)
 
-install -p -dm755 %{buildroot}%{_docdir}/%{name}/licenses
-mv %{buildroot}%{_prefix}/GNU-AGPL-3.0        %{buildroot}%{_docdir}/%{name}/licenses
-mv %{buildroot}%{_prefix}/README-TOKUKV       %{buildroot}%{_docdir}/%{name}/licenses
-mv %{buildroot}%{_prefix}/THIRD-PARTY-NOTICES %{buildroot}%{_docdir}/%{name}/licenses
-mv %{buildroot}%{_prefix}/NEWS                %{buildroot}%{_docdir}/%{name}
-mv %{buildroot}%{_prefix}/README              %{buildroot}%{_docdir}/%{name}
+install -p -dm755 %{buildroot}%{_docdir}/%{product_name}/licenses
+mv %{buildroot}%{_prefix}/GNU-AGPL-3.0        %{buildroot}%{_docdir}/%{product_name}/licenses
+mv %{buildroot}%{_prefix}/README-TOKUKV       %{buildroot}%{_docdir}/%{product_name}/licenses
+mv %{buildroot}%{_prefix}/THIRD-PARTY-NOTICES %{buildroot}%{_docdir}/%{product_name}/licenses
+mv %{buildroot}%{_prefix}/NEWS                %{buildroot}%{_docdir}/%{product_name}
+mv %{buildroot}%{_prefix}/README              %{buildroot}%{_docdir}/%{product_name}
 
-install -p -Dm755 %{buildroot}%{_prefix}/scripts/tokumxstat.py %{buildroot}%{_datadir}/%{name}/scripts/tokumxstat.py
+install -p -Dm755 %{buildroot}%{_prefix}/scripts/tokumxstat.py %{buildroot}%{_datadir}/%{product_name}/scripts/tokumxstat.py
 rm -rf %{buildroot}%{_prefix}/scripts
 
-mkdir -p %{buildroot}%{_sharedstatedir}/%{name}
-mkdir -p %{buildroot}%{_localstatedir}/log/%{name}
-mkdir -p %{buildroot}%{_localstatedir}/run/%{name}
+mkdir -p %{buildroot}%{_sharedstatedir}/%{product_name}
+mkdir -p %{buildroot}%{_localstatedir}/log/%{product_name}
+mkdir -p %{buildroot}%{_localstatedir}/run/%{product_name}
 
 %if 0%{?fedora} >= 15
 install -p -dm755 %{buildroot}%{_unitdir}
-install -p -Dm644 %{SOURCE5} %{buildroot}%{_libdir}/../lib/tmpfiles.d/%{name}.conf
-install -p -Dm644 %{SOURCE6} %{buildroot}%{_unitdir}/%{daemon}.service
+install -p -Dm644 %{SOURCE5} %{buildroot}%{_libdir}/../lib/tmpfiles.d/%{product_name}.conf
+install -p -Dm644 %{SOURCE6} %{buildroot}%{_unitdir}/%{product_name}.service
 %else
-install -p -Dm755 %{SOURCE1} $RPM_BUILD_ROOT%{_initddir}/%{name}
+install -p -Dm755 %{SOURCE1} $RPM_BUILD_ROOT%{_initddir}/%{product_name}
 %endif
 
-install -p -Dm644 %{SOURCE2} %{buildroot}%{_sysconfdir}/logrotate.d/%{name}
-install -p -Dm644 %{SOURCE3} %{buildroot}%{_sysconfdir}/%{name}.conf
-install -p -Dm644 %{SOURCE4} %{buildroot}%{_sysconfdir}/sysconfig/%{daemon}
+install -p -Dm644 %{SOURCE2} %{buildroot}%{_sysconfdir}/logrotate.d/%{product_name}
+install -p -Dm644 %{SOURCE3} %{buildroot}%{_sysconfdir}/%{product_name}.conf
+sed -i'' -e "s#@LIBDIR@#"%{_libdir}"#" %{buildroot}%{_sysconfdir}/%{product_name}.conf
+install -p -Dm644 %{SOURCE4} %{buildroot}%{_sysconfdir}/sysconfig/%{product_name}
 
 install -dm755 %{buildroot}%{_mandir}/man1
 install -p -m644 -t %{buildroot}%{_mandir}/man1 debian/*.1
+
+mv %{buildroot}%{_libdir}/%{product_name}/libmongoclient.so %{buildroot}%{_libdir}
 
 %post -p /sbin/ldconfig
 
 %postun -p /sbin/ldconfig
 
 %pre server
-getent group %{name} >/dev/null || groupadd -r %{name}
-getent passwd %{name} >/dev/null || \
-    useradd -r -g %{name} -u 184 -d %{_sharedstatedir}/%{name} -s /sbin/nologin \
-    -c "TokuMX Database Server" %{name}
+getent group %{product_name} >/dev/null || groupadd -r %{product_name}
+getent passwd %{product_name} >/dev/null || \
+    useradd -r -g %{product_name} -u 184 -d %{_sharedstatedir}/%{product_name} -s /sbin/nologin \
+    -c "TokuMX Database Server" %{product_name}
 exit 0
 
 %post server
 %if 0%{?fedora} >= 15
-/bin/systemd-tmpfiles --create %{daemon}.conf
-/bin/systemctl daemon-reload &>/dev/null || :
+/bin/systemd-tmpfiles --create %{product_name}.conf
+/bin/systemctl product_name-reload &>/dev/null || :
 %else
-/sbin/chkconfig --add %{daemon}
+/sbin/chkconfig --add %{product_name}
 %endif
 
 echo ""
@@ -201,14 +254,14 @@ echo "  echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled"
 echo ""
 %if 0%{?fedora} >= 15
 echo "A tmpfiles.d (see systemd-tmpfiles(8)) configuration has been installed to"
-echo %{_prefix}"/lib/tmpfiles.d/"%{name}".conf, which will disable transparent huge pages"
+echo %{_prefix}"/lib/tmpfiles.d/"%{product_name}".conf, which will disable transparent huge pages"
 echo "on startup."
 echo ""
 echo "To invoke it now without rebooting, run"
-echo "  systemd-tmpfiles --create "%{name}".conf"
+echo "  systemd-tmpfiles --create "%{product_name}".conf"
 echo ""
 echo "To disable this behavior, you can create a symlink to /dev/null"
-echo "  ln -s /dev/null "%{_sysconfdir}"/tmpfiles.d/"%{name}".conf"
+echo "  ln -s /dev/null "%{_sysconfdir}"/tmpfiles.d/"%{product_name}".conf"
 %else
 echo "This will be done for you automatically by the initscripts."
 %endif
@@ -219,11 +272,11 @@ echo ""
 %preun server
 if [ $1 = 0 ] ; then
 %if 0%{?fedora} >= 15
-    /bin/systemctl --no-reload disable %{daemon}.service &>/dev/null
-    /bin/systemctl stop %{daemon}.service &>/dev/null
+    /bin/systemctl --no-reload disable %{product_name}.service &>/dev/null
+    /bin/systemctl stop %{product_name}.service &>/dev/null
 %else
-    /sbin/service %{daemon} stop >/dev/null 2>&1
-    /sbin/chkconfig --del %{daemon}
+    /sbin/service %{product_name} stop >/dev/null 2>&1
+    /sbin/chkconfig --del %{product_name}
 %endif
 fi
 
@@ -233,9 +286,9 @@ fi
 %endif
 if [ "$1" -ge "1" ] ; then
 %if 0%{?fedora} >= 15
-    /bin/systemctl try-restart %{daemon}.service &>/dev/null
+    /bin/systemctl try-restart %{product_name}.service &>/dev/null
 %else
-    /sbin/service %{daemon} condrestart >/dev/null 2>&1 || :
+    /sbin/service %{product_name} condrestart >/dev/null 2>&1 || :
 %endif
 fi
 
@@ -263,35 +316,46 @@ fi
 %{_mandir}/man1/mongostat.1*
 %{_mandir}/man1/mongotop.1*
 
-%{_datadir}/%{name}/scripts/tokumxstat.py*
+%{_datadir}/%{product_name}/scripts/tokumxstat.py*
 
 %files common
-%doc %{_docdir}/%{name}/licenses/GNU-AGPL-3.0
-%doc %{_docdir}/%{name}/licenses/README-TOKUKV
-%doc %{_docdir}/%{name}/licenses/THIRD-PARTY-NOTICES
-%doc %{_docdir}/%{name}/README
-%doc %{_docdir}/%{name}/NEWS
+%doc %{_docdir}/%{product_name}/licenses/GNU-AGPL-3.0
+%doc %{_docdir}/%{product_name}/licenses/README-TOKUKV
+%doc %{_docdir}/%{product_name}/licenses/THIRD-PARTY-NOTICES
+%doc %{_docdir}/%{product_name}/README
+%doc %{_docdir}/%{product_name}/NEWS
 
-%{_libdir}/%{name}/libHotBackup.so
-%{_libdir}/%{name}/libtokufractaltree.so
-%{_libdir}/%{name}/libtokuportability.so
+%{_libdir}/%{product_name}/libHotBackup.so
+%{_libdir}/%{product_name}/libtokufractaltree.so
+%{_libdir}/%{product_name}/libtokuportability.so
+%if 0%{tokumx_enterprise}
+%{_libdir}/%{product_name}/plugins
+%endif
+
+%files -n lib%{name}
+
+%{_libdir}/libmongoclient.so
+
+%files -n lib%{name}-devel
+
+%{_includedir}
 
 %files server
 %{_bindir}/mongod
 %{_bindir}/mongos
 %{_mandir}/man1/mongod.1*
 %{_mandir}/man1/mongos.1*
-%dir %attr(0755, %{name}, root) %{_sharedstatedir}/%{name}
-%dir %attr(0755, %{name}, root) %{_localstatedir}/log/%{name}
-%dir %attr(0755, %{name}, root) %{_localstatedir}/run/%{name}
-%config(noreplace) %{_sysconfdir}/logrotate.d/%{name}
-%config(noreplace) %{_sysconfdir}/%{name}.conf
-%config(noreplace) %{_sysconfdir}/sysconfig/%{daemon}
+%dir %attr(0755, %{product_name}, root) %{_sharedstatedir}/%{product_name}
+%dir %attr(0755, %{product_name}, root) %{_localstatedir}/log/%{product_name}
+%dir %attr(0755, %{product_name}, root) %{_localstatedir}/run/%{product_name}
+%config(noreplace) %{_sysconfdir}/logrotate.d/%{product_name}
+%config(noreplace) %{_sysconfdir}/%{product_name}.conf
+%config(noreplace) %{_sysconfdir}/sysconfig/%{product_name}
 %if 0%{?fedora} >= 15
-%{_unitdir}/%{daemon}.service
-%{_libdir}/../lib/tmpfiles.d/%{name}.conf
+%{_unitdir}/%{product_name}.service
+%{_libdir}/../lib/tmpfiles.d/%{product_name}.conf
 %else
-%{_initddir}/%{daemon}
+%{_initddir}/%{product_name}
 %endif
 
 %changelog

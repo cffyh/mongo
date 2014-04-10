@@ -83,6 +83,12 @@ namespace mongo {
         bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
 
             const char* ns = jsobj.getStringField( "checkShardingIndex" );
+
+            if (nsToDatabaseSubstring(ns) != dbname) {
+                errmsg = "incorrect database in ns";
+                return false;
+            }
+
             BSONObj keyPattern = jsobj.getObjectField( "keyPattern" );
 
             if ( keyPattern.isEmpty() ) {
@@ -184,9 +190,8 @@ namespace mongo {
     } cmdCheckShardingIndex;
 
     class SplitVectorFinder {
-        std::exception *_ex;
         Collection *_cl;
-        const IndexDetails &_idx;
+        const IndexDetails* _idx;
         KeyPattern _chunkPattern;
         Ordering _ordering;
         storage::Key _chunkMin, _chunkMax;
@@ -250,7 +255,7 @@ namespace mongo {
                 // If we got the same as the current chunk min, that means there are many documents
                 // with that same key (or a few really big ones).  Since we can't split in the
                 // middle of them, we fall back to just using a cursor from this point forward.
-                if (!_idx.isIdIndex()) {
+                if (!_idx->isIdIndex()) {
                     _chunkMin.reset(*endKey, endPK);
                     _justSkipped += skipped;
                 }
@@ -262,14 +267,14 @@ namespace mongo {
             // query, and in BSONObj form to pass it back.
             _lastSplitKey = splitKey.getOwned();
             _splitPoints.push_back(_lastSplitKey);
-            KeyPattern kp(_idx.keyPattern());
+            KeyPattern kp(_idx->keyPattern());
             BSONObj modSplitKey = KeyPattern::toKeyFormat(kp.extendRangeBound(_lastSplitKey, false));
-            _chunkMin.reset(modSplitKey, _idx.isIdIndex() ? NULL : &minKey);
+            _chunkMin.reset(modSplitKey, _idx->isIdIndex() ? NULL : &minKey);
         }
 
         void slowFindSplitPoint(long long targetChunkSize) {
             long long skipped = 0;
-            for (shared_ptr<Cursor> c(Cursor::make(_cl, _idx, _chunkMin.key(), _chunkMax.key(), false, 1)); c->ok(); c->advance()) {
+            for (shared_ptr<Cursor> c(Cursor::make(_cl, *_idx, _chunkMin.key(), _chunkMax.key(), false, 1)); c->ok(); c->advance()) {
                 const BSONObj &currKey = c->currKey();
                 const BSONObj &currPK = c->currPK();
                 long long docsize = currKey.objsize() + currPK.objsize() + c->current().objsize();
@@ -286,9 +291,9 @@ namespace mongo {
                         }
                         _lastSplitKey = splitKey.getOwned();
                         _splitPoints.push_back(_lastSplitKey);
-                        KeyPattern kp(_idx.keyPattern());
+                        KeyPattern kp(_idx->keyPattern());
                         BSONObj modSplitKey = KeyPattern::toKeyFormat(kp.extendRangeBound(_lastSplitKey, false));
-                        _chunkMin.reset(modSplitKey, _idx.isIdIndex() ? NULL : &minKey);
+                        _chunkMin.reset(modSplitKey, _idx->isIdIndex() ? NULL : &minKey);
                         return;
                     }
                 }
@@ -299,14 +304,14 @@ namespace mongo {
         }
 
       public:
-        SplitVectorFinder(Collection *cl, const IndexDetails &idx, const BSONObj &chunkPattern, const BSONObj &min, const BSONObj &max,
+        SplitVectorFinder(Collection *cl, const IndexDetails* idx, const BSONObj &chunkPattern, const BSONObj &min, const BSONObj &max,
                           vector<BSONObj> &splitPoints)
                 : _cl(cl),
                   _idx(idx),
                   _chunkPattern(chunkPattern.getOwned()),
-                  _ordering(Ordering::make(_idx.keyPattern())),
-                  _chunkMin(min, _idx.isIdIndex() ? NULL : &minKey),
-                  _chunkMax(max, _idx.isIdIndex() ? NULL : &maxKey),
+                  _ordering(Ordering::make(_idx->keyPattern())),
+                  _chunkMin(min, _idx->isIdIndex() ? NULL : &minKey),
+                  _chunkMax(max, _idx->isIdIndex() ? NULL : &maxKey),
                   _splitPoints(splitPoints),
                   _chunkTooBig(false),
                   _doneFindingPoints(false),
@@ -314,7 +319,7 @@ namespace mongo {
                   _useCursor(false),
                   _lastSplitKey()
         {
-            massert(16799, "shard key pattern must be a prefix of the index key pattern", chunkPattern.isPrefixOf(_idx.keyPattern()));
+            massert(16799, "shard key pattern must be a prefix of the index key pattern", chunkPattern.isPrefixOf(_idx->keyPattern()));
         }
 
         // Functors that wrap the above callbacks
@@ -337,9 +342,18 @@ namespace mongo {
 
         // Schedules the calls down into get_key_after_bytes.
         void find(long long maxChunkSize, long long maxSplitPoints) {
+            //
+            //
+            // HACK!!!!! Need to find a better way to do this
+            // TODO: Zardosht talk to Leif about this
+            // Problem is that getKeyAfterBytes is templated, so we cannot virtualize it
+            //
+            //
+            const IndexDetailsBase* idxBase = dynamic_cast<const IndexDetailsBase *>(_idx);
+            massert(17237, "bug: failed to dynamically cast IndexDetails to IndexDetailsBase", idxBase != NULL);
             {
                 IsTooBigCallback cb(*this);
-                _idx.getKeyAfterBytes(_chunkMin, maxChunkSize, cb);
+                idxBase->getKeyAfterBytes(_chunkMin, maxChunkSize, cb);
             }
             if (!_chunkTooBig) {
                 return;
@@ -348,7 +362,7 @@ namespace mongo {
                 // If _chunkMin doesn't actually exist (could be {x: MinKey} for example) we need to
                 // get the actual first key in the chunk so that we make sure we don't try to split
                 // on the first key.
-                shared_ptr<Cursor> c(Cursor::make(_cl, _idx, _chunkMin.key(), _chunkMax.key(), false, 1, 1));
+                shared_ptr<Cursor> c(Cursor::make(_cl, *_idx, _chunkMin.key(), _chunkMax.key(), false, 1, 1));
                 massert(16794, "didn't find anything actually in our chunk, but we thought we should split it", c->ok());
                 _lastSplitKey = _chunkPattern.prettyKey(c->currKey());
             }
@@ -364,7 +378,7 @@ namespace mongo {
                         _useCursor = false;
                     }
                     else {
-                        _idx.getKeyAfterBytes(_chunkMin, targetChunkSize, cb);
+                        idxBase->getKeyAfterBytes(_chunkMin, targetChunkSize, cb);
                     }
                 }
             }
@@ -484,11 +498,11 @@ namespace mongo {
             }
 
             if (!forceMedianSplit && idx->clustering()) {
-                SplitVectorFinder finder(cl, *idx, keyPattern, min, max, splitKeys);
+                SplitVectorFinder finder(cl, idx, keyPattern, min, max, splitKeys);
                 finder.find(maxChunkSize, maxSplitPoints);
             } else {
                 // Haven't implemented a better version using get_key_after_bytes yet, do the slow thing
-                Collection::Stats stats;
+                CollectionData::Stats stats;
                 cl->fillCollectionStats(stats, NULL, 1);
                 const long long recCount = stats.count;
                 const long long dataSize = stats.size;
@@ -892,7 +906,7 @@ namespace mongo {
                     catch (DBException &e) {
                         warning() << e << endl;
                         error() << "splitChunk error updating the chunk ending in " << endKey << endl;
-                        throw e;
+                        throw;
                     }
 
                     // remember this chunk info for logging later

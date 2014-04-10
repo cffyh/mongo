@@ -19,7 +19,10 @@ if (NOT (JS_ENGINE STREQUAL v8 OR
   message(FATAL_ERROR "invalid JS_ENGINE ${JS_ENGINE}, options are sm or v8")
 endif ()
 
-set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+set(CMAKE_MODULE_PATH
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/ft-index/cmake_modules"
+  )
 
 set_property(DIRECTORY APPEND PROPERTY COMPILE_DEFINITIONS
   MONGO_EXPOSE_MACROS
@@ -153,10 +156,11 @@ function (install_executables component)
                 $<TARGET_FILE:${target}>
         )
       install(FILES
-        ${CMAKE_CURRENT_BINARY_DIR}/${target}.dbg
+        "${CMAKE_CURRENT_BINARY_DIR}/${target}.dbg"
         COMPONENT tokumx_debuginfo
         DESTINATION bin
         )
+      set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_MAKE_CLEAN_FILES "${CMAKE_CURRENT_BINARY_DIR}/${target}.dbg")
     endif ()
     install(TARGETS
       ${target}
@@ -172,8 +176,58 @@ function(target_link_whole_libraries target)
       target_link_libraries(${target} -Wl,-force_load ${lib})
     endforeach ()
   else ()
-    target_link_libraries(${target} -Wl,-whole-archive ${ARGN} -Wl,-no-whole-archive)
+    target_link_libraries(${target} -Wl,--start-group -Wl,-whole-archive ${ARGN} -Wl,-no-whole-archive -Wl,--end-group)
   endif ()
+endfunction()
+
+set(TOKU_CMAKE_SCRIPT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/ft-index/cmake")
+include(TokuMergeLibs)
+
+function(link_recursive_deps bin)
+  set(_all_libs)
+  set(_next_is_combined_libname 0)
+  set(_combined_libname all_${bin}_deps)
+  foreach (arg ${ARGN})
+    if (_next_is_combined_libname)
+      set(_combined_libname ${arg})
+      set(_next_is_combined_libname 0)
+    elseif (arg STREQUAL COMBINED_LIBNAME)
+      set(_next_is_combined_libname 1)
+    else ()
+      list(APPEND _all_libs ${arg})
+    endif ()
+  endforeach ()
+  list(LENGTH _all_libs _cur_num_libs)
+  set(_last_num_libs 0)
+  while (_cur_num_libs GREATER _last_num_libs)
+    set(_new_libs)
+    foreach (_lib ${_all_libs})
+      get_target_property(_loc ${_lib} LOCATION)
+      if (_loc)
+        if (APPLE)
+          # for unknown reasons, LINK_INTERFACE_LIBRARIES doesn't work on osx
+          get_property(_libdeps
+            TARGET ${_lib}
+            PROPERTY INTERFACE_LINK_LIBRARIES
+            )
+        else ()
+          get_property(_libdeps
+            TARGET ${_lib}
+            PROPERTY LINK_INTERFACE_LIBRARIES
+            )
+        endif ()
+        list(APPEND _new_libs ${_libdeps})
+      endif ()
+    endforeach ()
+    list(APPEND _all_libs ${_new_libs})
+    list(REMOVE_DUPLICATES _all_libs)
+    set(_last_num_libs ${_cur_num_libs})
+    list(LENGTH _all_libs _cur_num_libs)
+  endwhile ()
+  if (NOT TARGET ${_combined_libname})
+    toku_merge_static_libs(${_combined_libname} ${_combined_libname} "${_all_libs}")
+  endif ()
+  target_link_whole_libraries(${bin} ${_combined_libname})
 endfunction()
 
 if (CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -198,6 +252,46 @@ if (TOKUMX_SET_RPATH)
   endif ()
 endif ()
 
+if (EXISTS "${CMAKE_SOURCE_DIR}/src/mongo/plugins/tokumx-backup-plugin/")
+  set(TOKUMX_ENTERPRISE ON)
+else ()
+  set(TOKUMX_ENTERPRISE OFF)
+endif ()
+
+function (git_version name dir)
+  if ("${${name}_GIT_VERSION}" STREQUAL "")
+    find_program(GIT git)
+    if (GIT MATCHES NOTFOUND)
+      set(FATAL_ERROR "git not found")
+    endif ()
+
+    get_filename_component(_real_dir ${dir} REALPATH)
+    execute_process(
+      COMMAND ${GIT} rev-parse HEAD
+      WORKING_DIRECTORY "${_real_dir}"
+      OUTPUT_VARIABLE _git_version
+      RESULT_VARIABLE _git_retval
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+      )
+    if (NOT _git_retval EQUAL 0)
+      message(WARNING "${GIT}: error: ${retval}")
+      set(_git_version "unknown")
+    endif ()
+    set(${name}_GIT_VERSION ${_git_version} CACHE STRING "git version for ${name}")
+  endif ()
+  string(SUBSTRING ${${name}_GIT_VERSION} 0 7 _git_shortver)
+  set(${name}_GIT_SHORTVER ${_git_shortver} CACHE STRING "git shortver for ${name}" FORCE)
+endfunction ()
+
+git_version(TOKUMX "${CMAKE_SOURCE_DIR}")
+git_version(TOKUKV "${CMAKE_SOURCE_DIR}/src/third_party/ft-index")
+
+if (TOKUMX_ENTERPRISE)
+  git_version(TOKUBACKUP "${CMAKE_SOURCE_DIR}/src/third_party/backup/")
+  git_version(TOKUMX_BACKUP_PLUGIN "${CMAKE_SOURCE_DIR}/src/mongo/plugins/tokumx-backup-plugin")
+endif ()
+
 add_subdirectory(src/third_party)
 include_directories(
   ${Boost_INCLUDE_DIRS}
@@ -208,6 +302,7 @@ include_directories(
 if (JS_ENGINE STREQUAL v8)
   include_directories(${V8_INCLUDE_DIRS})
 endif ()
+
 add_subdirectory(src/mongo)
 
 add_subdirectory(distsrc)
@@ -226,6 +321,8 @@ install(FILES src/SConscript.client
   DESTINATION src
   )
 
+add_subdirectory(jstests)
+
 file(READ src/mongo/util/version.cpp version_cpp_contents)
 string(REGEX MATCH "const char tokumxVersionString\\[\\] = \"(([0-9]+)\\.([0-9]+)\\.([0-9]+)([^\"]*))\"\\;" unused "${version_cpp_contents}")
 set(CPACK_PACKAGE_VERSION ${CMAKE_MATCH_1})
@@ -233,24 +330,37 @@ set(CPACK_PACKAGE_VERSION_MAJOR ${CMAKE_MATCH_2})
 set(CPACK_PACKAGE_VERSION_MINOR ${CMAKE_MATCH_3})
 set(CPACK_PACKAGE_VERSION_PATCH ${CMAKE_MATCH_4})
 
+if (TOKUMX_ENTERPRISE)
+  set(TOKUMX_PRODUCTNAME "tokumx-e")
+else ()
+  set(TOKUMX_PRODUCTNAME "tokumx")
+endif ()
+if (NOT TOKUMX_DISTNAME)
+  set(TOKUMX_DISTNAME "${TOKUMX_GIT_SHORTVER}-ft-${TOKUKV_GIT_SHORTVER}")
+  if (TOKUMX_ENTERPRISE)
+    set(TOKUMX_DISTNAME "${TOKUMX_DISTNAME}-ba-${TOKUBACKUP_GIT_SHORTVER}-bp-${TOKUMX_BACKUP_PLUGIN_GIT_SHORTVER}")
+  endif ()
+endif ()
+
+set(CPACK_PACKAGE_FILE_NAME "${TOKUMX_PRODUCTNAME}-${TOKUMX_DISTNAME}-${CPACK_SYSTEM_NAME}")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "a high-performance mongodb server with fractal tree storage")
 set(CPACK_PACKAGE_VENDOR "Tokutek, Inc.")
-set(CPACK_PACKAGE_INSTALL_DIRECTORY "tokumx-${CPACK_PACKAGE_VERSION}")
 set(CPACK_ARCHIVE_COMPONENT_INSTALL TRUE)
 set(CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY TRUE)
 set(CPACK_GENERATOR TGZ)
 
 set(CPACK_COMPONENT_TOKUMX_DEBUGINFO_GROUP debuginfo)
-set(CPACK_COMPONENT_TOKUMX_SERVER_GROUP server)
-set(CPACK_COMPONENT_TOKUMX_MISC_GROUP server)
-set(CPACK_COMPONENT_TOKUMX_TOOLS_GROUP server)
-set(CPACK_COMPONENT_TOKUMX_LIBS_EXTRA_GROUP server)
-set(CPACK_COMPONENT_TOKUMX_PLUGINS_GROUP server)
-set(CPACK_COMPONENT_TOKUMX_CLIENT_HEADERS_GROUP client)
-set(CPACK_COMPONENT_TOKUMX_CLIENT_SOURCES_GROUP client)
-set(CPACK_COMPONENT_TOKUMX_CLIENT_MISC_GROUP client)
-set(CPACK_COMPONENT_TOKUKV_LIBS_SHARED_GROUP server)
-set(CPACK_COMPONENT_TOKUBACKUP_LIBS_SHARED_GROUP server)
+set(CPACK_COMPONENT_TOKUMX_SERVER_GROUP main)
+set(CPACK_COMPONENT_TOKUMX_MISC_GROUP main)
+set(CPACK_COMPONENT_TOKUMX_TOOLS_GROUP main)
+set(CPACK_COMPONENT_TOKUMX_LIBS_EXTRA_GROUP main)
+set(CPACK_COMPONENT_TOKUMX_PLUGINS_GROUP main)
+set(CPACK_COMPONENT_TOKUMX_CLIENT_HEADERS_GROUP devel)
+set(CPACK_COMPONENT_TOKUMX_CLIENT_SOURCES_GROUP devel-source)
+set(CPACK_COMPONENT_TOKUMX_CLIENT_LIBS_GROUP devel)
+set(CPACK_COMPONENT_TOKUMX_CLIENT_MISC_GROUP devel-source)
+set(CPACK_COMPONENT_TOKUKV_LIBS_SHARED_GROUP main)
+set(CPACK_COMPONENT_TOKUBACKUP_LIBS_SHARED_GROUP main)
 set(CPACK_COMPONENTS_ALL
   tokumx_server
   tokumx_misc
@@ -258,11 +368,17 @@ set(CPACK_COMPONENTS_ALL
   tokumx_libs_extra
   tokumx_plugins
   tokumx_client_headers
-  tokumx_client_sources
-  tokumx_client_misc
+  tokumx_client_libs
   tokukv_libs_shared
   tokubackup_libs_shared
   tokumx_debuginfo
   )
+
+if (TOKUMX_ENTERPRISE)
+  message(STATUS "Building TokuMX Enterprise ${CPACK_PACKAGE_VERSION}")
+else ()
+  message(STATUS "Building TokuMX Community ${CPACK_PACKAGE_VERSION}")
+endif ()
+message(STATUS "Package name: ${CPACK_PACKAGE_FILE_NAME}")
 
 include(CPack)

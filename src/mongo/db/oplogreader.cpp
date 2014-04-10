@@ -22,7 +22,7 @@
 #include "mongo/db/ops/update.h"
 
 namespace mongo {
-    const BSONObj reverseNaturalObj = BSON( "$natural" << -1 );
+    const BSONObj reverseIDObj = BSON( "_id" << -1 );
 
     BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
 
@@ -99,7 +99,7 @@ namespace mongo {
             b.appendOID( "_id" , 0 , true );
             b.append( "host", myname );
             me = b.obj();
-            updateObjects("local.me", me, BSONObj(), true, false, true);
+            updateObjects("local.me", me, BSONObj(), true, false);
         }
         transaction.commit(0);
     }
@@ -228,7 +228,7 @@ namespace mongo {
         BSONObjBuilder query;
         query.append("_id", q.done());
         retCursor.reset(
-            _conn->query(rsoplog, Query(query.done()).sort(reverseNaturalObj), 0, 0, NULL, QueryOption_SlaveOk).release()
+            _conn->query(rsoplog, Query(query.done()).sort(reverseIDObj), 0, 0, NULL, QueryOption_SlaveOk).release()
             );
         return retCursor;
     }

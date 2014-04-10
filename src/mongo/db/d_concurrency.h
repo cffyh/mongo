@@ -53,8 +53,6 @@ namespace mongo {
         static bool atLeastReadLocked(const StringData& ns); // true if this db is locked
         static void assertAtLeastReadLocked(const StringData& ns);
         static void assertWriteLocked(const StringData& ns);
-
-        static bool dbLevelLockingEnabled(); 
         
         static LockStat* globalLockStat();
         static LockStat* nestableLockStat( Nestable db );
@@ -91,7 +89,7 @@ namespace mongo {
             bool noop;
         public:
             // timeoutms is only for writelocktry -- deprecated -- do not use
-            GlobalWrite(const string &context = "", const int timeoutms = -1);
+            GlobalWrite(const string &context, const int timeoutms = -1);
             virtual ~GlobalWrite();
         };
         class GlobalRead : public ScopedLock { // recursive is ok
@@ -99,7 +97,7 @@ namespace mongo {
             bool noop;
         public:
             // timeoutms is only for readlocktry -- deprecated -- do not use
-            GlobalRead(const string &context = "", const int timeoutms = -1);
+            GlobalRead(const string &context, const int timeoutms = -1);
             virtual ~GlobalRead();
         };
 
@@ -122,7 +120,7 @@ namespace mongo {
             void unlockDB();
 
         public:
-            DBWrite(const StringData& dbOrNs, const string &context = "");
+            DBWrite(const StringData& dbOrNs, const string &context);
             virtual ~DBWrite();
 
             class UpgradeToExclusive : private boost::noncopyable {
@@ -151,6 +149,7 @@ namespace mongo {
             WrapperForRWLock *_weLocked;
             const string _what;
             bool _nested;
+            Nestable _nestedDB;
         };
 
         // lock this database for reading. do not shared_lock globally first, that is handledin herein. 
@@ -162,7 +161,7 @@ namespace mongo {
         public:
             void lockDB(const string &ns, const string &context);
             void unlockDB();
-            DBRead(const StringData& dbOrNs, const string &context = "");
+            DBRead(const StringData& dbOrNs, const string &context);
             virtual ~DBRead();
 
         private:
@@ -170,6 +169,7 @@ namespace mongo {
             WrapperForRWLock *_weLocked;
             string _what;
             bool _nested;
+            Nestable _nestedDB;
             
         };
 
@@ -179,7 +179,7 @@ namespace mongo {
         bool _got;
         scoped_ptr<Lock::GlobalRead> _dbrlock;
     public:
-        readlocktry(int tryms, const string &context = "");
+        readlocktry(int tryms, const string &context);
         ~readlocktry();
         bool got() const { return _got; }
     };
@@ -188,7 +188,7 @@ namespace mongo {
         bool _got;
         scoped_ptr<Lock::GlobalWrite> _dbwlock;
     public:
-        writelocktry(int tryms, const string &context = "");
+        writelocktry(int tryms, const string &context);
         ~writelocktry();
         bool got() const { return _got; }
     };

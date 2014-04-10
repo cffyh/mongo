@@ -134,7 +134,10 @@ namespace mongo {
 
     bool Member::syncable() const {
         bool buildIndexes = theReplSet ? theReplSet->buildIndexes() : true;
-        return hbinfo().up() && (config().buildIndexes || !buildIndexes) && state().readable();
+        return hbinfo().up() &&
+            (config().buildIndexes || !buildIndexes) &&
+            state().readable() &&
+            (hbinfo().oplogVersion <= ReplSetConfig::OPLOG_VERSION);
     }
 
     const Member* ReplSetImpl::getMemberToSyncTo() {
@@ -423,9 +426,6 @@ namespace mongo {
                 Lock::DBWrite lk("local", lockReason);
                 Client::Transaction fileOpsTransaction(DB_SERIALIZABLE);
                 deleteOplogFiles();
-                // now recreate the oplog
-                createOplog();
-                openOplogFiles();
                 fileOpsTransaction.commit(0);
             }
 
@@ -452,6 +452,7 @@ namespace mongo {
 
                     if (!ret) {
                         veto(source->fullName(), 600);
+                        cloneTransaction.abort();
                         sleepsecs(300);
                         return false;
                     }
@@ -464,29 +465,35 @@ namespace mongo {
 
                     // first copy the replInfo, as we will use its information
                     // to determine  how much of the opLog to copy
-                    BSONObj q;
-                    cloneCollectionData(conn,
-                                        rsReplInfo,
-                                        q,
-                                        true, //copyIndexes
-                                        false //logForRepl
-                                        );
+                    {
+                        Client::Context ctx( "local" );
+                        BSONObj q;
+                        cloneCollection(conn,
+                                            "local",
+                                            rsReplInfo,
+                                            q,
+                                            true, //copyIndexes
+                                            false //logForRepl
+                                            );
 
-                    // copy entire oplog (probably overkill)
-                    cloneCollectionData(conn,
-                                        rsoplog,
-                                        q,
-                                        true, //copyIndexes
-                                        false //logForRepl
-                                        );
+                        // copy entire oplog (probably overkill)
+                        cloneCollection(conn,
+                                            "local",
+                                            rsoplog,
+                                            q,
+                                            true, //copyIndexes
+                                            false //logForRepl
+                                            );
 
-                    // copy entire oplog.refs (probably overkill)
-                    cloneCollectionData(conn,
-                                        rsOplogRefs,
-                                        q,
-                                        true, //copyIndexes
-                                        false //logForRepl
-                                        );
+                        // copy entire oplog.refs (probably overkill)
+                        cloneCollection(conn,
+                                            "local",
+                                            rsOplogRefs,
+                                            q,
+                                            true, //copyIndexes
+                                            false //logForRepl
+                                            );
+                    }
                     cloneTransaction.commit(0);
                 }
 
@@ -500,11 +507,6 @@ namespace mongo {
                 sleepsecs(1);
                 return false;
             }
-        }
-        else {
-            LOCK_REASON(lockReason, "repl: opening oplog files");
-            Lock::DBWrite lk("local", lockReason);
-            openOplogFiles();
         }
         if (needGapsFilled) {
             _fillGaps(&r);

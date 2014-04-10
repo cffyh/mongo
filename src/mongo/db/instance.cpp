@@ -24,11 +24,15 @@
 #include <sys/file.h>
 #endif
 
+#include <boost/function.hpp>
 #include <boost/thread/thread.hpp>
 #include <boost/filesystem/operations.hpp>
 
+#include <db.h>
+
 #include "mongo/util/time_support.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 
 #include "mongo/bson/util/atomic_int.h"
 
@@ -38,6 +42,7 @@
 #include "mongo/db/introspect.h"
 #include "mongo/db/repl.h"
 #include "mongo/db/client.h"
+#include "mongo/db/crash.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
@@ -296,7 +301,7 @@ namespace mongo {
     void mongoAbort(const char *msg) { 
         if( reportEventToSystem ) 
             reportEventToSystem(msg);
-        rawOut(msg);
+        dumpCrashInfo(msg);
         ::abort();
     }
 
@@ -524,7 +529,7 @@ namespace mongo {
         Client::Context ctx(ns);
         scoped_ptr<Client::AlternateTransactionStack> altStack(opNeedsAltTxn(ns) ? new Client::AlternateTransactionStack : NULL);
         Client::Transaction transaction(DB_SERIALIZABLE);
-        UpdateResult res = updateObjects(ns, updateobj, query, upsert, multi, true);
+        UpdateResult res = updateObjects(ns, updateobj, query, upsert, multi);
         transaction.commit();
         lastError.getSafe()->recordUpdate( res.existing , res.num , res.upserted ); // for getlasterror
     }
@@ -804,6 +809,12 @@ namespace mongo {
     }
 
     static void _buildHotIndex(const char *ns, Message &m, const vector<BSONObj> objs) {
+        // We intend to take the DBWrite lock only to initiate and finalize the
+        // index build. Since we'll be releasing lock in between these steps, we
+        // take the operation lock here to ensure that we do not step down as primary.
+        RWLockRecursive::Shared oplock(operationLock);
+        uassert(16902, "not master", isMasterNs(ns));
+
         uassert(16905, "Can only build one index at a time.", objs.size() == 1);
 
         DEV {
@@ -812,16 +823,14 @@ namespace mongo {
             verify(!sc.handlePossibleShardedMessage(m, 0));
         }
 
-        LOCK_REASON(lockReason, "building hot index");
-        scoped_ptr<Lock::DBWrite> lk(new Lock::DBWrite(ns, lockReason));
-
-        uassert(16902, "not master", isMasterNs(ns));
+        LOCK_REASON(lockReasonBegin, "initializing hot index build");
+        scoped_ptr<Lock::DBWrite> lk(new Lock::DBWrite(ns, lockReasonBegin));
 
         const BSONObj &info = objs[0];
         const StringData &coll = info["ns"].Stringdata();
 
-        scoped_ptr<Client::Transaction> transaction(new Client::Transaction(DB_SERIALIZABLE));
-        shared_ptr<Collection::Indexer> indexer;
+        Client::Transaction transaction(DB_SERIALIZABLE);
+        shared_ptr<CollectionIndexer> indexer;
 
         // Prepare the index build. Performs index validation and marks
         // the collection as having an index build in progress.
@@ -832,32 +841,48 @@ namespace mongo {
                 // No error or action if the index already exists. We need to commit
                 // the transaction in case this is an ensure index on the _id field
                 // and the ns was created by getOrCreateCollection()
-                transaction->commit();
+                transaction.commit();
                 return;
             }
 
             _insertObjects(ns, objs, false, 0, true);
             indexer = cl->newIndexer(info, true);
             indexer->prepare();
+            addToNamespacesCatalog(IndexDetails::indexNamespace(coll, info["name"].String()));
         }
 
-        // Perform the index build
         {
-            Lock::DBWrite::Downgrade dg(lk);
-            uassert(16906, "not master: after indexer setup but before build", isMasterNs(ns));
+            /**
+             * We really shouldn't do this anywhere if we can help it, this is a bit of a special
+             * case, so it's a local class.
+             */
+            class WriteLockReleaser : boost::noncopyable {
+                scoped_ptr<Lock::DBWrite> &_lk;
+                std::string _ns;
+              public:
+                WriteLockReleaser(scoped_ptr<Lock::DBWrite> &lk, const StringData &ns) : _lk(lk), _ns(ns.toString()) {
+                    _lk.reset();
+                }
+                ~WriteLockReleaser() {
+                    LOCK_REASON(lockReasonCommit, "committing/aborting hot index build");
+                    _lk.reset(new Lock::DBWrite(_ns, lockReasonCommit));
+                }
+            } wlr(lk, ns);
 
-            Client::Context ctx(ns);
+            // Perform the index build
             indexer->build();
         }
 
-        uassert(16907, "not master: after indexer build but before commit", isMasterNs(ns));
 
         // Commit the index build
         {
             Client::Context ctx(ns);
             indexer->commit();
+            Collection *cl = getCollection(coll);
+            verify(cl);
+            cl->noteIndexBuilt();
         }
-        transaction->commit();
+        transaction.commit();
     }
 
     static void lockedReceivedInsert(const char *ns, Message &m, const vector<BSONObj> &objs, CurOp &op, const bool keepGoing) {
@@ -960,6 +985,58 @@ namespace mongo {
             if (r != 0 && r != DB_NOTFOUND)
                 storage::handle_ydb_error(r);
         }
+    }
+
+    class ApplyToDatabaseNamesWrapper {
+        vector<string> _batch;
+
+        int cb(const DBT *key, const DBT *val) {
+            size_t length = key->size;
+            if (length > 0) {
+                const char *cp = (const char *) key->data + length - 1;
+                if (*cp == 0) {
+                    length -= 1;
+                }
+                StringData dbname((const char *) key->data, length);
+                if (dbname.endsWith(".ns")) {
+                    _batch.push_back(dbname.substr(0, dbname.size() - 3).toString());
+                }
+            }
+            const size_t max_size = 1<<10;
+            return ((_batch.size() < max_size)
+                    ? TOKUDB_CURSOR_CONTINUE
+                    : 0);
+        }
+
+      public:
+        static int callback(const DBT *key, const DBT *val, void *extra) {
+            ApplyToDatabaseNamesWrapper *e = static_cast<ApplyToDatabaseNamesWrapper *>(extra);
+            return e->cb(key, val);
+        }
+
+        vector<string> &batch() {
+            return _batch;
+        }
+    };
+
+    Status applyToDatabaseNames(boost::function<Status (const StringData &)> f) {
+        verify(Lock::isRW());
+        verify(cc().hasTxn());
+        storage::DirectoryCursor c(storage::env, cc().txn().db_txn());
+        ApplyToDatabaseNamesWrapper wrapper;
+        int r = 0;
+        Status s = Status::OK();
+        while (r == 0 && s.isOK()) {
+            r = c.dbc()->c_getf_next(c.dbc(), 0, &ApplyToDatabaseNamesWrapper::callback, &wrapper);
+            if (r != 0 && r != DB_NOTFOUND) {
+                storage::handle_ydb_error(r);
+            }
+            for (vector<string>::const_iterator it = wrapper.batch().begin(); s.isOK() && it != wrapper.batch().end(); ++it) {
+                s = f(*it);
+            }
+            wrapper.batch().clear();
+        }
+        return s;
     }
 
     /* returns true if there is data on this server.  useful when starting replication.

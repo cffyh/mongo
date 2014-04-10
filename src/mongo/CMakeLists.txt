@@ -27,40 +27,6 @@ set_source_files_properties(
   "${CMAKE_CURRENT_BINARY_DIR}/base/error_codes.cpp"
   PROPERTIES GENERATED TRUE)
 
-if (NOT (TOKUMX_GIT_VERSION AND TOKUKV_GIT_VERSION))
-  find_program(GIT git)
-  if (GIT MATCHES NOTFOUND)
-    set(SEND_ERROR "git not found")
-  endif ()
-endif ()
-if (NOT TOKUMX_GIT_VERSION)
-  execute_process(
-    COMMAND ${GIT} rev-parse HEAD
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../.."
-    OUTPUT_VARIABLE TOKUMX_GIT_VERSION
-    RESULT_VARIABLE retval
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-    )
-  if (NOT retval EQUAL 0)
-    message(WARNING "${GIT}: error: ${retval}")
-    set(TOKUMX_GIT_VERSION "unknown")
-  endif ()
-endif ()
-if (NOT TOKUKV_GIT_VERSION)
-  execute_process(
-    COMMAND ${GIT} rev-parse HEAD
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ft-index"
-    OUTPUT_VARIABLE TOKUKV_GIT_VERSION
-    RESULT_VARIABLE retval
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-    )
-  if (NOT retval EQUAL 0)
-    message(WARNING "${GIT}: error: ${retval}")
-    set(TOKUKV_GIT_VERSION "unknown")
-  endif ()
-endif ()
 if (JS_ENGINE STREQUAL v8)
   set(TOKUMX_JS_ENGINE V8)
 elseif (JS_ENGINE STREQUAL sm)
@@ -103,23 +69,6 @@ set_source_files_properties(
   PROPERTIES GENERATED TRUE)
 configure_file(buildinfo.cpp.in buildinfo.cpp)
 
-add_subdirectory(base)
-add_subdirectory(bson)
-add_subdirectory(client)
-add_subdirectory(db)
-add_subdirectory(platform)
-add_subdirectory(plugins)
-add_subdirectory(s)
-add_subdirectory(scripting)
-add_subdirectory(shell)
-add_subdirectory(tools)
-add_subdirectory(util)
-
-if (BUILD_TESTING)
-  add_subdirectory(dbtests)
-  add_subdirectory(unittest)
-endif ()
-
 set_source_files_properties(
   "${CMAKE_CURRENT_BINARY_DIR}/shell/mongo.cpp"
   PROPERTIES GENERATED TRUE)
@@ -131,7 +80,7 @@ add_library(mongocommon STATIC
   db/dbmessage
   )
 add_dependencies(mongocommon generate_mongo_cpp generate_action_types)
-target_link_libraries(mongocommon LINK_PRIVATE
+target_link_libraries(mongocommon LINK_PUBLIC
   mongocommon_client
   mongocommon_util
   bson
@@ -141,192 +90,16 @@ target_link_libraries(mongocommon LINK_PRIVATE
   ${Boost_LIBRARIES}
   )
 
-add_executable(mongod
-  db/db
-  db/commands/touch
-  )
-add_dependencies(mongod generate_error_codes generate_action_types install_tdb_h)
-
-target_link_libraries(mongod
-  ${TokuBackup_LIBRARIES}
-  )
-if (NOT APPLE)
-  target_link_whole_libraries(mongod
-    jemalloc
-    )
-endif ()
-target_link_whole_libraries(mongod
-  coredb
-  coreserver
-  mongodandmongos
-  serveronly
-  base
-  )
-target_link_libraries(mongod
-  ${TokuKV_LIBRARIES}
-  ${TOKUMX_SSL_LIBRARIES}
-  )
-
-foreach (tool
-    dump
-    restore
-    export
-    import
-    stat
-    top
-    2toku
-    files
-    bridge
-    )
-  add_executable(mongo${tool} tools/${tool})
-  add_dependencies(mongo${tool} generate_error_codes generate_action_types install_tdb_h)
-  if (NOT APPLE)
-    target_link_whole_libraries(mongo${tool}
-      jemalloc
-      )
-  endif ()
-  target_link_whole_libraries(mongo${tool}
-    alltools
-    base
-    )
-  target_link_libraries(mongo${tool}
-    ${TokuKV_LIBRARIES}
-    ${TOKUMX_SSL_LIBRARIES}
-    )
-endforeach ()
-install_executables(tokumx_tools
-  mongodump
-  mongorestore
-  mongoexport
-  mongoimport
-  mongostat
-  mongotop
-  mongo2toku
-  mongofiles
-  )
-target_link_libraries(mongofiles gridfs)
-
-add_executable(docgen tools/docgeneratormain)
-add_executable(loadgen tools/loadgenerator)
-add_executable(bsondump tools/bsondump)
-foreach (tool
-    docgen
-    loadgen
-    bsondump
-    )
-  add_dependencies(${tool} generate_error_codes generate_action_types)
-  if (NOT APPLE)
-    target_link_whole_libraries(${tool}
-      jemalloc
-      )
-  endif ()
-  target_link_whole_libraries(${tool}
-    alltools
-    base
-    )
-  target_link_libraries(${tool}
-    ${TokuKV_LIBRARIES}
-    ${TOKUMX_SSL_LIBRARIES}
-    )
-endforeach ()
-install_executables(tokumx_tools bsondump)
-target_link_libraries(docgen docgenerator)
-target_link_libraries(loadgen docgenerator)
-
-add_executable(mongos
-  s/server
-  )
-add_dependencies(mongos generate_error_codes generate_action_types)
-if (NOT APPLE)
-  target_link_whole_libraries(mongos
-    jemalloc
-    )
-endif ()
-target_link_whole_libraries(mongos
-  mongoscore
-  coreserver
-  coredb
-  mongocommon
-  coreshard
-  dbcmdline
-  mongodandmongos
-  s_upgrade
-  )
-target_link_libraries(mongos
-  ${TokuKV_LIBRARIES}
-  ${TOKUMX_SSL_LIBRARIES}
-  )
-
-if (APPLE OR PCAP_FOUND)
-  add_executable(mongosniff tools/sniffer)
-  add_dependencies(mongosniff generate_error_codes generate_action_types)
-  set_target_properties(mongosniff PROPERTIES
-    COMPILE_DEFINITIONS MONGO_EXPOSE_MACROS
-    )
-  if (NOT APPLE)
-    target_link_whole_libraries(mongosniff
-      jemalloc
-      )
-  endif ()
-  target_link_whole_libraries(mongosniff
-    gridfs
-    serveronly
-    coreserver
-    coredb
-    notmongodormongos
-    base
-    )
-  target_link_libraries(mongosniff
-    ${PCAP_LIBRARIES}
-    ${TokuKV_LIBRARIES}
-    ${TOKUMX_SSL_LIBRARIES}
-    )
-  install_executables(tokumx_tools
-    mongosniff
-    )
-endif ()
-
-set_source_files_properties(
-  "${CMAKE_CURRENT_BINARY_DIR}/shell/mongo-server.cpp"
-  PROPERTIES GENERATED TRUE)
-add_executable(mongo
-  shell/dbshell
-  shell/shell_utils
-  shell/shell_utils_extended
-  shell/shell_utils_launcher
-  "${CMAKE_CURRENT_BINARY_DIR}/shell/mongo-server.cpp"
-  shell/linenoise
-  shell/linenoise_utf8
-  shell/mk_wcwidth
-  )
-add_dependencies(mongo generate_mongo_server_cpp generate_error_codes generate_action_types)
-target_link_whole_libraries(mongo
-  clientandshell
-  mongocommon
-  mongocommon_client
-  scripting
-  notmongodormongos
-  base
-  )
-target_link_libraries(mongo
-  ${PCRE_LIBRARIES}
-  ${TOKUMX_SSL_LIBRARIES}
-  )
-install_executables(tokumx_tools
-  mongo
-  )
-install_executables(tokumx_server
-  mongos
-  mongod
-  )
-
-if (BUILD_TESTING)
-  add_test(mongo/shell/test_shell
-    "${PYTHON2}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../../buildscripts/test_shell.py"
-      "$<TARGET_FILE:mongo>"
-    )
-endif ()
+add_subdirectory(base)
+add_subdirectory(bson)
+add_subdirectory(db)
+add_subdirectory(platform)
+add_subdirectory(plugins)
+add_subdirectory(s)
+add_subdirectory(scripting)
+add_subdirectory(shell)
+add_subdirectory(tools)
+add_subdirectory(util)
 
 set(client_sources
   base/configuration_variable_manager.cpp
@@ -411,22 +184,52 @@ if (USE_SASL_CLIENT)
     client/sasl_client_session.cpp
     )
 endif ()
-add_library(mongoclient STATIC
-  "${CMAKE_CURRENT_BINARY_DIR}/base/error_codes.cpp"
-  "${CMAKE_CURRENT_BINARY_DIR}/buildinfo.cpp"
-  ${client_sources})
-add_dependencies(mongoclient generate_error_codes generate_action_types install_tdb_h)
-target_link_libraries(mongoclient LINK_PRIVATE
-  ${Boost_LIBRARIES}
-  ${CMAKE_THREAD_LIBS_INIT}
-  )
-if (USE_SASL_CLIENT)
-  target_link_libraries(mongoclient LINK_PRIVATE
-    ${SASL_LIBRARIES}
+if (TOKUMX_CLIENT_LIB_SHARED)
+  add_library(mongoclient SHARED
+    "${CMAKE_CURRENT_BINARY_DIR}/base/error_codes.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/buildinfo.cpp"
+    ${client_sources}
     )
+  target_link_libraries(mongoclient
+    ${Boost_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+    )
+  if (USE_SASL_CLIENT)
+    target_link_libraries(mongoclient
+      ${SASL_LIBRARIES}
+      )
+  endif ()
+  if (CMAKE_SYSTEM_NAME STREQUAL Linux)
+    set_target_properties(mongoclient PROPERTIES
+      LINK_FLAGS "-Wl,--as-needed -Wl,-zdefs"
+      )
+  endif ()
+else ()
+  add_library(mongoclient STATIC
+    "${CMAKE_CURRENT_BINARY_DIR}/base/error_codes.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/buildinfo.cpp"
+    ${client_sources}
+    )
+  target_link_libraries(mongoclient LINK_PUBLIC
+    ${Boost_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+    )
+  if (USE_SASL_CLIENT)
+    target_link_libraries(mongoclient LINK_PUBLIC
+      ${SASL_LIBRARIES}
+      )
+  endif ()
 endif ()
+add_dependencies(mongoclient generate_error_codes generate_action_types install_tdb_h)
+install(TARGETS mongoclient
+  DESTINATION ${INSTALL_LIBDIR}
+  COMPONENT tokumx_client_libs
+  )
 
-foreach (src ${client_sources})
+foreach (src
+    ${client_sources}
+    bson/bsondemo/bsondemo.cpp
+    )
   get_filename_component(dir ${src} PATH)
   install(FILES ${src}
     DESTINATION src/mongo/${dir}
@@ -443,13 +246,25 @@ if (NOT USE_SASL_CLIENT)
     )
 endif ()
 install(FILES
-  "${CMAKE_CURRENT_BINARY_DIR}/base/error_codes.cpp"
   "${CMAKE_CURRENT_BINARY_DIR}/base/error_codes.h"
+  DESTINATION include/mongo/base
+  COMPONENT tokumx_client_headers
+  )
+install(FILES
+  "${CMAKE_CURRENT_BINARY_DIR}/db/auth/action_type.h"
+  DESTINATION include/mongo/db/auth
+  COMPONENT tokumx_client_headers
+  )
+install(FILES
+  "${CMAKE_CURRENT_BINARY_DIR}/base/error_codes.cpp"
+  base/generate_error_codes.py
+  base/error_codes.err
   DESTINATION src/mongo/base
   COMPONENT tokumx_client_sources
   )
 install(FILES
-  "${CMAKE_CURRENT_BINARY_DIR}/db/auth/action_type.h"
+  db/auth/generate_action_types.py
+  db/auth/action_types.txt
   DESTINATION src/mongo/db/auth
   COMPONENT tokumx_client_sources
   )
@@ -485,10 +300,438 @@ foreach (client_header_dir
     ${client_header_dir}/*.hpp
     )
   install(FILES ${headers}
-    DESTINATION src/mongo/${client_header_dir}
+    DESTINATION include/mongo/${client_header_dir}
     COMPONENT tokumx_client_headers
     )
 endforeach ()
+
+add_subdirectory(client)
+
+if (BUILD_TESTING)
+  add_subdirectory(dbtests)
+  add_subdirectory(unittest)
+endif ()
+
+# In order for link_recursive_deps to be able to resolve the full dependency tree, all the libraries
+# need to be defined before we call it, so all the test executables have to come after all the above
+# subdirectories.
+if (BUILD_TESTING)
+  foreach (test
+      configuration_variable_manager_test
+      initializer_dependency_graph_test
+      initializer_test
+      owned_pointer_vector_test
+      owned_pointer_map_test
+      parse_number_test
+      status_test
+      string_data_test
+      units_test
+      )
+    add_executable(${test} base/${test})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    link_recursive_deps(${test}
+      COMBINED_LIBNAME basic_unittest_deps
+      unittest_main
+      unittest_crutch
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+
+  foreach (test_source
+      util/builder_test
+      util/bson_extract_test
+      mutable/mutable_bson_test
+      mutable/mutable_bson_heap_test
+      mutable/mutable_bson_builder_test
+      mutable/mutable_bson_algo_test
+      bson_field_test
+      bson_validate_test
+      )
+    string(REGEX REPLACE "^.*/" "" test ${test_source})
+    add_executable(${test} bson/${test_source})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    link_recursive_deps(${test}
+      COMBINED_LIBNAME bson_unittest_deps
+      bson
+      unittest_main
+      unittest_crutch
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+
+  foreach (test
+      dbclient_rs_test
+      scoped_db_conn_test
+      )
+    add_executable(${test} client/${test})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    link_recursive_deps(${test}
+      COMBINED_LIBNAME client_rs_unittest_deps
+      unittest_main
+      coredb
+      coreserver
+      coreshard
+      dbcmdline
+      mongocommon
+      mongodandmongos
+      mongoscore
+      ${TokuKV_LIBRARIES}
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+  target_link_libraries(dbclient_rs_test
+    mocklib
+    )
+
+  foreach (test
+      cmdline_test
+      field_ref_test
+      index_set_test
+      server_parameters_test
+      )
+    add_executable(${test} db/${test})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    link_recursive_deps(${test}
+      COMBINED_LIBNAME basic_unittest_deps
+      unittest_main
+      unittest_crutch
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+
+  target_link_whole_libraries(cmdline_test dbcmdline)
+  target_link_whole_libraries(field_ref_test db_common)
+  target_link_whole_libraries(index_set_test bson index_set)
+  target_link_whole_libraries(server_parameters_test server_parameters)
+
+  foreach (test
+      atomic_word_test
+      bits_test
+      random_test
+      )
+    add_executable(${test} platform/${test})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    link_recursive_deps(${test}
+      COMBINED_LIBNAME basic_unittest_deps
+      unittest_main
+      unittest_crutch
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+
+  foreach (test
+      chunk_version_test
+      field_parser_test
+      mongo_version_range_test
+      type_changelog_test
+      type_chunk_test
+      type_collection_test
+      type_config_version_test
+      type_database_test
+      type_locks_test
+      type_lockpings_test
+      type_settings_test
+      type_shard_test
+      type_mongos_test
+      type_tags_test
+      )
+    add_executable(${test} s/${test})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    link_recursive_deps(${test}
+      COMBINED_LIBNAME sharding_unittest_deps
+      s_base
+      unittest_main
+      unittest_crutch
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+
+  target_link_libraries(mongo_version_range_test bson)
+
+  # no crutch
+  foreach (test
+      chunk_diff_test
+      collection_manager_test
+      metadata_loader_test
+      )
+    add_executable(${test} s/${test})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    link_recursive_deps(${test}
+      COMBINED_LIBNAME sharding_nocrutch_unittest_deps
+      unittest_main
+      mongocommon
+      s_metadata
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+
+  foreach (test
+      balancer_policy_tests
+      shard_conn_test
+      shard_test
+      )
+    add_executable(${test} s/${test})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    link_recursive_deps(${test}
+      COMBINED_LIBNAME sharding_other_unittest_deps
+      unittest_main
+      mongoscore
+      coreshard
+      mongocommon
+      coreserver
+      coredb
+      dbcmdline
+      mongodandmongos
+      ${TokuKV_LIBRARIES}
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+  target_link_whole_libraries(collection_manager_test mocklib)
+  target_link_whole_libraries(metadata_loader_test mocklib)
+  target_link_whole_libraries(shard_conn_test mocklib)
+
+  foreach (test
+      bson_template_evaluator_test
+      v8_deadline_monitor_test
+      )
+    add_executable(${test} scripting/${test})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    target_link_libraries(${test}
+      unittest_main
+      foundation
+      unittest_crutch
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+  
+  target_link_libraries(bson_template_evaluator_test bson_template_evaluator)
+
+  foreach (test_source
+      concurrency/partitioned_counter_test
+      descriptive_stats_test
+      fail_point_test
+      processinfo_test
+      safe_num_test
+      string_map_test
+      stringutils_test
+      text_test
+      )
+    string(REGEX REPLACE "^.*/" "" test ${test_source})
+    add_executable(${test} util/${test_source})
+    add_dependencies(${test} generate_error_codes generate_action_types)
+    link_recursive_deps(${test}
+      COMBINED_LIBNAME basic_unittest_deps
+      unittest_main
+      unittest_crutch
+      ${TOKUMX_SSL_LIBRARIES}
+      )
+  endforeach ()
+
+  target_link_libraries(descriptive_stats_test bson)
+  target_link_libraries(fail_point_test fail_point)
+  target_link_libraries(processinfo_test processinfo)
+  target_link_libraries(safe_num_test bson)
+  target_link_libraries(string_map_test bson)
+  target_link_libraries(stringutils_test stringutils)
+
+  # no crutch
+  add_executable(sock_test util/net/sock_test)
+  add_dependencies(sock_test generate_error_codes generate_action_types)
+  link_recursive_deps(sock_test
+    unittest_main
+    mongocommon
+    notmongodormongos
+    ${TOKUMX_SSL_LIBRARIES}
+    )
+
+  add_executable(md5_test util/md5_test util/md5main)
+  add_dependencies(md5_test generate_error_codes generate_action_types)
+  link_recursive_deps(md5_test
+    COMBINED_LIBNAME basic_unittest_deps
+    unittest_main
+    unittest_crutch
+    ${TOKUMX_SSL_LIBRARIES}
+    )
+  target_link_whole_libraries(md5_test
+    md5
+    )
+endif ()
+
+add_executable(mongod
+  db/db
+  db/commands/touch
+  )
+add_dependencies(mongod generate_error_codes generate_action_types install_tdb_h)
+
+target_link_libraries(mongod
+  ${TokuBackup_LIBRARIES}
+  )
+if (NOT APPLE)
+  target_link_whole_libraries(mongod
+    jemalloc
+    )
+endif ()
+link_recursive_deps(mongod
+  coredb
+  coreserver
+  mongodandmongos
+  serveronly
+  ${TOKUMX_SSL_LIBRARIES}
+  )
+
+foreach (tool
+    dump
+    restore
+    export
+    import
+    stat
+    top
+    2toku
+    files
+    bridge
+    )
+  add_executable(mongo${tool} tools/${tool})
+endforeach ()
+add_executable(bsondump tools/bsondump)
+foreach (tool
+    mongodump
+    mongorestore
+    mongoexport
+    mongoimport
+    mongostat
+    mongotop
+    mongo2toku
+    mongofiles
+    mongobridge
+    bsondump
+    )
+  add_dependencies(${tool} generate_error_codes generate_action_types install_tdb_h)
+  if (NOT APPLE)
+    target_link_whole_libraries(${tool}
+      jemalloc
+      )
+  endif ()
+  link_recursive_deps(${tool}
+    COMBINED_LIBNAME all_tool_deps
+    alltools
+    ${TOKUMX_SSL_LIBRARIES}
+    )
+endforeach ()
+install_executables(tokumx_tools
+  mongodump
+  mongorestore
+  mongoexport
+  mongoimport
+  mongostat
+  mongotop
+  mongo2toku
+  mongofiles
+  bsondump
+  )
+target_link_libraries(mongofiles gridfs)
+
+add_executable(docgen tools/docgeneratormain)
+add_executable(loadgen tools/loadgenerator)
+foreach (tool
+    docgen
+    loadgen
+    )
+  add_dependencies(${tool} generate_error_codes generate_action_types)
+  if (NOT APPLE)
+    target_link_whole_libraries(${tool}
+      jemalloc
+      )
+  endif ()
+  link_recursive_deps(${tool}
+    COMBINED_LIBNAME docgen_tool_deps
+    alltools
+    docgenerator
+    ${TOKUMX_SSL_LIBRARIES}
+    )
+endforeach ()
+
+add_executable(mongos
+  s/server
+  )
+add_dependencies(mongos generate_error_codes generate_action_types)
+if (NOT APPLE)
+  target_link_whole_libraries(mongos
+    jemalloc
+    )
+endif ()
+link_recursive_deps(mongos
+  mongoscore
+  coreserver
+  coredb
+  mongocommon
+  coreshard
+  dbcmdline
+  mongodandmongos
+  s_upgrade
+  ${TOKUMX_SSL_LIBRARIES}
+  )
+
+if (APPLE OR PCAP_FOUND)
+  add_executable(mongosniff tools/sniffer)
+  add_dependencies(mongosniff generate_error_codes generate_action_types)
+  set_target_properties(mongosniff PROPERTIES
+    COMPILE_DEFINITIONS MONGO_EXPOSE_MACROS
+    )
+  if (NOT APPLE)
+    target_link_whole_libraries(mongosniff
+      jemalloc
+      )
+  endif ()
+  link_recursive_deps(mongosniff
+    gridfs
+    serveronly
+    coreserver
+    coredb
+    notmongodormongos
+    ${PCAP_LIBRARIES}
+    ${TOKUMX_SSL_LIBRARIES}
+    )
+  install_executables(tokumx_tools
+    mongosniff
+    )
+endif ()
+
+set_source_files_properties(
+  "${CMAKE_CURRENT_BINARY_DIR}/shell/mongo-server.cpp"
+  PROPERTIES GENERATED TRUE)
+add_executable(mongo
+  shell/dbshell
+  shell/shell_utils
+  shell/shell_utils_extended
+  shell/shell_utils_launcher
+  "${CMAKE_CURRENT_BINARY_DIR}/shell/mongo-server.cpp"
+  shell/linenoise
+  shell/linenoise_utf8
+  shell/mk_wcwidth
+  )
+add_dependencies(mongo generate_mongo_server_cpp generate_error_codes generate_action_types)
+link_recursive_deps(mongo
+  clientandshell
+  mongocommon
+  scripting
+  ${PCRE_LIBRARIES}
+  ${TOKUMX_SSL_LIBRARIES}
+  )
+install_executables(tokumx_tools
+  mongo
+  )
+install_executables(tokumx_server
+  mongos
+  mongod
+  )
+
+if (BUILD_TESTING)
+  add_test(NAME mongo/shell/test_shell
+    COMMAND "${PYTHON2}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../buildscripts/test_shell.py"
+      "$<TARGET_FILE:mongo>"
+    )
+endif ()
 
 find_library(GCC_S_LIBRARY NAMES gcc_s PATHS
   /lib64
@@ -521,4 +764,178 @@ if (NOT STDCXX_LIBRARY MATCHES NOTFOUND)
     DESTINATION ${INSTALL_LIBDIR}
     COMPONENT tokumx_libs_extra
     )
+endif ()
+
+if (BUILD_TESTING)
+  set(js_cxx_ctest_root "${CMAKE_BINARY_DIR}/ctest/mongo/cxx")
+  set(js_cxx_dbpath "${js_cxx_ctest_root}/db")
+  set(js_cxx_logpath "${js_cxx_ctest_root}/log")
+  file(MAKE_DIRECTORY "${js_cxx_dbpath}")
+  add_test(
+    NAME mongo/cxx/clean-mongod-dbpath
+    COMMAND bash -c "ls ${js_cxx_dbpath}/* | xargs rm -rf"
+    )
+  add_test(
+    NAME mongo/cxx/start-mongod
+    COMMAND $<TARGET_FILE:mongod>
+    --dbpath "${js_cxx_dbpath}"
+    --fork
+    --logpath "${js_cxx_logpath}"
+    --setParameter enableTestCommands=1
+    )
+  set_tests_properties(mongo/cxx/start-mongod PROPERTIES
+    DEPENDS mongo/cxx/clean-mongod-dbpath
+    )
+  add_test(
+    NAME mongo/cxx/check-mongod
+    COMMAND /bin/bash -c "for i in `seq 1 180`; do if $<TARGET_FILE:mongo> --eval 'db.version()'; then break; fi; if [ $i = 180 ]; then exit 1; fi; sleep 1; done"
+    )
+  set_tests_properties(mongo/cxx/check-mongod PROPERTIES
+    DEPENDS mongo/cxx/start-mongod
+    )
+  add_test(
+    NAME mongo/cxx/stop-mongod
+    COMMAND $<TARGET_FILE:mongo>
+    --eval "db.adminCommand({shutdown: 1, force: true})"
+    )
+  set_tests_properties(mongo/cxx/stop-mongod PROPERTIES
+    WILL_FAIL TRUE
+    DEPENDS mongo/cxx/check-mongod
+    )
+
+  function (add_mongo_test section name)
+    add_test(
+      NAME mongo/cxx/${section}/${name}
+      COMMAND ${ARGN}
+      )
+    set_tests_properties(mongo/cxx/${section}/${name} PROPERTIES
+      DEPENDS mongo/cxx/check-mongod
+      )
+    set_property(TEST mongo/cxx/stop-mongod APPEND PROPERTY
+      DEPENDS mongo/cxx/${section}/${name}
+      )
+  endfunction ()
+
+  foreach (test
+      configuration_variable_manager_test
+      initializer_dependency_graph_test
+      initializer_test
+      owned_pointer_vector_test
+      owned_pointer_map_test
+      parse_number_test
+      status_test
+      string_data_test
+      units_test
+      )
+    add_mongo_test(base ${test} ${test})
+  endforeach ()
+
+  foreach (test
+      builder_test
+      bson_extract_test
+      mutable_bson_test
+      mutable_bson_heap_test
+      mutable_bson_builder_test
+      mutable_bson_algo_test
+      bson_field_test
+      bson_validate_test
+      )
+    add_mongo_test(bson ${test} ${test})
+  endforeach ()
+
+  foreach (test
+      atomic_word_test
+      bits_test
+      random_test
+      )
+    add_mongo_test(platform ${test} ${test})
+  endforeach ()
+
+  foreach (test
+      balancer_policy_tests
+      chunk_diff_test
+      chunk_version_test
+      collection_manager_test
+      field_parser_test
+      metadata_loader_test
+      mongo_version_range_test
+      shard_conn_test
+      shard_test
+      type_changelog_test
+      type_chunk_test
+      type_collection_test
+      type_config_version_test
+      type_database_test
+      type_lockpings_test
+      type_locks_test
+      type_mongos_test
+      type_settings_test
+      type_shard_test
+      type_tags_test
+      )
+    add_mongo_test(s ${test} ${test})
+  endforeach ()
+
+  foreach (test
+      partitioned_counter_test
+      descriptive_stats_test
+      fail_point_test
+      md5_test
+      processinfo_test
+      safe_num_test
+      sock_test
+      string_map_test
+      stringutils_test
+      text_test
+      )
+    add_mongo_test(util ${test} ${test})
+  endforeach ()
+
+  foreach (test
+      action_set_test
+      principal_set_test
+      privilege_set_test
+      authorization_manager_test
+      )
+    add_mongo_test(db/auth ${test} ${test})
+  endforeach ()
+
+  foreach (test
+      cmdline_test
+      field_ref_test
+      index_set_test
+      server_parameters_test
+      )
+    add_mongo_test(db ${test} ${test})
+  endforeach ()
+
+  foreach (test
+      unittest_test
+      fixture_test
+      )
+    add_mongo_test(unittest ${test} ${test})
+  endforeach ()
+
+  foreach (test
+      authTest
+      clientTest
+      dbclient_rs_test
+      firstExample
+      httpClientTest
+      scoped_db_conn_test
+      secondExample
+      tutorial
+      whereExample
+      )
+    add_mongo_test(client ${test} ${test})
+  endforeach ()
+
+  foreach (test
+      bson_template_evaluator_test
+      v8_deadline_monitor_test
+      )
+    add_mongo_test(scripting ${test} ${test})
+  endforeach ()
+
+  add_mongo_test(dbtests smokeTest smokeTest)
 endif ()

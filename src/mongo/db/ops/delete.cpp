@@ -42,7 +42,8 @@ namespace mongo {
                                const BSONObj &max,
                                const BSONObj &keyPattern,
                                const bool maxInclusive,
-                               const bool fromMigrate) {
+                               const bool fromMigrate,
+                               uint64_t flags) {
         Collection *cl = getCollection(ns);
         if (cl == NULL) {
             return 0;
@@ -61,8 +62,8 @@ namespace mongo {
              c->ok(); c->advance()) {
             const BSONObj pk = c->currPK();
             const BSONObj obj = c->current();
-            OpLogHelpers::logDelete(ns.c_str(), obj, fromMigrate);
-            deleteOneObject(cl, pk, obj);
+            OplogHelpers::logDelete(ns.c_str(), obj, fromMigrate);
+            deleteOneObject(cl, pk, obj, flags);
             nDeleted++;
         }
         return nDeleted;
@@ -83,7 +84,7 @@ namespace mongo {
         if (!pk.isEmpty()) {
             if (queryByPKHack(cl, pk, pattern, obj)) {
                 if (logop) {
-                    OpLogHelpers::logDelete(ns, obj, false);
+                    OplogHelpers::logDelete(ns, obj, false);
                 }
                 deleteOneObject(cl, pk, obj);
                 return 1;
@@ -121,7 +122,7 @@ namespace mongo {
             }
 
             if (logop) {
-                OpLogHelpers::logDelete(ns, obj, false);
+                OplogHelpers::logDelete(ns, obj, false);
             }
             deleteOneObject(cl, pk, obj);
             nDeleted++;

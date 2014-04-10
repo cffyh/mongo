@@ -152,7 +152,7 @@ namespace mongo {
 
     /* ---------------------------------------------------------------------- */
 
-    IndexCursor::IndexCursor( Collection *cl, const IndexDetails &idx,
+    IndexCursor::IndexCursor( CollectionData *cl, const IndexDetails &idx,
                               const BSONObj &startKey, const BSONObj &endKey,
                               bool endKeyInclusive, int direction, int numWanted ) :
         _cl(cl),
@@ -161,26 +161,26 @@ namespace mongo {
         _startKey(startKey),
         _endKey(endKey),
         _endKeyInclusive(endKeyInclusive),
-        _multiKey(_cl->isMultikey(_cl->idxNo(_idx))),
+        _multiKey(cl->isMultiKey(cl->idxNo(idx))),
         _direction(direction),
         _bounds(),
         _boundsMustMatch(true),
         _nscanned(0),
         _nscannedObjects(0),
         _prelock(!cc().opSettings().getJustOne() && numWanted == 0),
-        _cursor(_idx, cursor_flags()),
         _tailable(false),
         _ok(false),
         _getf_iteration(0)
     {
         verify( _cl != NULL );
         TOKULOG(3) << toString() << ": constructor: bounds " << prettyIndexBounds() << endl;
-        DBC* cursor = _cursor.dbc();
+        _cursor = idx.getCursor(cursor_flags());
+        DBC* cursor = _cursor->dbc();
         cursor->c_set_check_interrupt_callback(cursor, cursor_check_interrupt, &_interrupt_extra);
         initializeDBC();
     }
 
-    IndexCursor::IndexCursor( Collection *cl, const IndexDetails &idx,
+    IndexCursor::IndexCursor( CollectionData *cl, const IndexDetails &idx,
                               const shared_ptr< FieldRangeVector > &bounds,
                               int singleIntervalLimit, int direction, int numWanted ) :
         _cl(cl),
@@ -189,14 +189,13 @@ namespace mongo {
         _startKey(),
         _endKey(),
         _endKeyInclusive(true),
-        _multiKey(_cl->isMultikey(_cl->idxNo(_idx))),
+        _multiKey(cl->isMultiKey(cl->idxNo(idx))),
         _direction(direction),
         _bounds(bounds),
         _boundsMustMatch(true),
         _nscanned(0),
         _nscannedObjects(0),
         _prelock(!cc().opSettings().getJustOne() && numWanted == 0),
-        _cursor(_idx, cursor_flags()),
         _tailable(false),
         _ok(false),
         _getf_iteration(0)
@@ -208,7 +207,8 @@ namespace mongo {
         _endKey = _bounds->endKey();
         _endKeyInclusive = _bounds->endKeyInclusive();
         TOKULOG(3) << toString() << ": constructor: bounds " << prettyIndexBounds() << endl;
-        DBC* cursor = _cursor.dbc();
+        _cursor = idx.getCursor(cursor_flags());
+        DBC* cursor = _cursor->dbc();
         cursor->c_set_check_interrupt_callback(cursor, cursor_check_interrupt, &_interrupt_extra);
         initializeDBC();
 
@@ -245,9 +245,9 @@ namespace mongo {
     }
 
     bool IndexCursor::cursor_check_interrupt(void* extra) {
-        struct cursor_interrupt_extra *info = static_cast<struct cursor_interrupt_extra *>(extra);
+        ExceptionSaver *info = static_cast<ExceptionSaver *>(extra);
         try {
-            killCurrentOp.checkForInterrupt(info->c); // uasserts if we should stop
+            killCurrentOp.checkForInterrupt(); // uasserts if we should stop
         } catch (const std::exception &ex) {
             info->saveException(ex);
             return true;
@@ -319,7 +319,7 @@ namespace mongo {
         DBT start = sKey.dbt();
         DBT end = eKey.dbt();
 
-        DBC *cursor = _cursor.dbc();
+        DBC *cursor = _cursor->dbc();
         const int r = cursor->c_set_bounds( cursor, &start, &end, true, 0 );
         if ( r != 0 ) {
             storage::handle_ydb_error(r);
@@ -515,14 +515,15 @@ namespace mongo {
         int r;
         const int rows_to_fetch = getf_fetch_count();
         struct cursor_getf_extra extra(&_buffer, rows_to_fetch);
-        DBC *cursor = _cursor.dbc();
+        DBC *cursor = _cursor->dbc();
         if ( forward() ) {
             r = cursor->c_getf_set_range(cursor, getf_flags(), &key_dbt, cursor_getf, &extra);
         } else {
             r = cursor->c_getf_set_range_reverse(cursor, getf_flags(), &key_dbt, cursor_getf, &extra);
         }
-        if ( extra.ex != NULL ) {
-            throw *extra.ex;
+        if (r == -1) {
+            extra.throwException();
+            msgasserted(17325, "got -1 from getf callback but no exception saved");
         }
         if (r == TOKUDB_INTERRUPTED) {
             _interrupt_extra.throwException();
@@ -713,14 +714,15 @@ again:      while ( !allInclusive && ok() ) {
         int r;
         const int rows_to_fetch = getf_fetch_count();
         struct cursor_getf_extra extra(&_buffer, rows_to_fetch);
-        DBC *cursor = _cursor.dbc();
+        DBC *cursor = _cursor->dbc();
         if ( forward() ) {
             r = cursor->c_getf_next(cursor, getf_flags(), cursor_getf, &extra);
         } else {
             r = cursor->c_getf_prev(cursor, getf_flags(), cursor_getf, &extra);
         }
-        if ( extra.ex != NULL ) {
-            throw *extra.ex;
+        if (r == -1) {
+            extra.throwException();
+            msgasserted(17326, "got -1 from getf callback but no exception saved");
         }
         if (r == TOKUDB_INTERRUPTED) {
             _interrupt_extra.throwException();

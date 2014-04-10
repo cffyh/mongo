@@ -36,6 +36,7 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/crash.h"
 #include "mongo/db/database.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
@@ -57,6 +58,9 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/delete.h"
+#include "mongo/db/relock.h"
+#include "mongo/db/server_parameters.h"
+#include "mongo/db/storage/assert_ids.h"
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/distlock.h"
@@ -85,6 +89,8 @@
 using namespace std;
 
 namespace mongo {
+
+    MONGO_EXPORT_SERVER_PARAMETER(migrateUniqueChecks, bool, true);
 
     bool findShardKeyIndexPattern_locked( const string& ns,
                                           const BSONObj& shardKeyPattern,
@@ -256,7 +262,7 @@ namespace mongo {
             return true;
         }
 
-        void done() {
+        void done(bool inDestructor) {
             log() << "MigrateFromStatus::done About to acquire sharding write lock to exit critical "
                     "section" << endl;
             ShardingState::SetVersionScope sc;
@@ -265,7 +271,13 @@ namespace mongo {
             scoped_lock l(_mutex);
             disableLogTxnOpsForSharding();
             _snapshotTaken = false;
-            clearMigrateLog();
+            if (!inDestructor) {
+                // If we're in the destructor, don't bother because this might throw.  This is an
+                // optimization that isn't necessary for correctness; next time we start a migration
+                // we'll clean it up then if we don't do it now.  The normal (non-error) path always
+                // cleans this up because we call done() explicitly.
+                clearMigrateLog();
+            }
             _active = false;
             _inCriticalSection = false;
             _inCriticalSectionCV.notify_all();
@@ -296,7 +308,7 @@ namespace mongo {
                    << " res: " << res.obj()
                    << " exc: " << e.what();
                 problem() << ss.str() << endl;
-                throw e;
+                throw;
             }
             try {
                 Client::WriteContext ctx(MIGRATE_LOG_REF_NS, lockReason);
@@ -316,7 +328,7 @@ namespace mongo {
                    << " res: " << res.obj()
                    << " exc: " << e.what();
                 problem() << ss.str() << endl;
-                throw e;
+                throw;
             }
         }
 
@@ -333,34 +345,23 @@ namespace mongo {
                     << "a capped collection is being sharded, this should not happen"
                     << " ns: " << ns
                     << " opstr: " << opstr,
-                    !(mongoutils::str::equals(opstr, OpLogHelpers::OP_STR_CAPPED_INSERT) ||
-                      mongoutils::str::equals(opstr, OpLogHelpers::OP_STR_CAPPED_DELETE)));
+                    !OplogHelpers::invalidOpForSharding(opstr));
 
             if (!_snapshotTaken) {
                 return false;
             }
 
-            if (mongoutils::str::equals(opstr, OpLogHelpers::OP_STR_INSERT) ||
-                mongoutils::str::equals(opstr, OpLogHelpers::OP_STR_DELETE) ||
-                mongoutils::str::equals(opstr, OpLogHelpers::OP_STR_UPDATE) ||
-                mongoutils::str::equals(opstr, OpLogHelpers::OP_STR_UPDATE_MODS)) {
+            if (OplogHelpers::shouldLogOpForSharding(opstr)) {
                 return isInRange(obj, _min, _max, _shardKeyPattern);
             }
             return false;
         }
 
-        bool shouldLogUpdateOp(const char *opstr, const char *ns, const BSONObj &oldObj, const BSONObj &newObj) {
+        bool shouldLogUpdateOp(const char *opstr, const char *ns, const BSONObj &oldObj) {
             // Just a sanity check.  ShardStrategy::_prepareUpdate() appears to prevent you from updating a document such that the shard key changes.
             // We just verify that old and new have the same shard key, and pass to the normal case.
             // But we call shouldLogOp first to avoid doing the comparison if, say, we're in the wrong ns and we can stop early.
-            bool should = shouldLogOp(opstr, ns, oldObj);
-            if (should) {
-                ShardKeyPattern shardKey(_shardKeyPattern);
-                BSONObj oldKey = shardKey.extractKey(oldObj);
-                BSONObj newKey = shardKey.extractKey(newObj);
-                verify(oldKey.equal(newKey));
-            }
-            return should;
+            return shouldLogOp(opstr, ns, oldObj);
         }
 
         void startObjForMigrateLog(BSONObjBuilder &b) {
@@ -633,7 +634,7 @@ namespace mongo {
         }
         ~MigrateStatusHolder() {
             if (!_isAnotherMigrationActive) {
-                migrateFromStatus.done();
+                migrateFromStatus.done(true);
             }
         }
 
@@ -649,8 +650,8 @@ namespace mongo {
         return migrateFromStatus.shouldLogOp(opstr, ns, obj);
     }
 
-    bool shouldLogUpdateOpForSharding(const char *opstr, const char *ns, const BSONObj &oldObj, const BSONObj &newObj) {
-        return migrateFromStatus.shouldLogUpdateOp(opstr, ns, oldObj, newObj);
+    bool shouldLogUpdateOpForSharding(const char *opstr, const char *ns, const BSONObj &oldObj) {
+        return migrateFromStatus.shouldLogUpdateOp(opstr, ns, oldObj);
     }
 
     void startObjForMigrateLog(BSONObjBuilder &b) {
@@ -696,6 +697,9 @@ namespace mongo {
                 return false;
             }
 
+            // This is effectively a "getMore" so it should have a read lock.
+            LOCK_REASON(lockReason, "sharding: getting first batch while starting clone transaction for migrate");
+            Client::ReadContext ctx(cmdObj["ns"].Stringdata(), lockReason);
             ClientCursor::Pin pin(id);
             ClientCursor *cursor = pin.c();
             massert(17227, "Cursor shouldn't have been deleted", cursor);
@@ -703,6 +707,11 @@ namespace mongo {
             BufBuilder &bb = result.bb();
             int lenBefore = bb.len();
             try {
+                OpSettings settings;
+                settings.setBulkFetch(true);
+                settings.setQueryCursorMode(DEFAULT_LOCK_CURSOR);
+                cc().setOpSettings(settings);
+                Client::WithTxnStack wts(cursor->transactions);
                 BSONObjBuilder cursorObj(result.subobjStart("cursor"));
                 cursorObj.append("id", id);
                 cursorObj.append("ns", cmdObj["ns"].Stringdata());
@@ -716,6 +725,7 @@ namespace mongo {
                 }
                 ab.done();
                 cursorObj.done();
+                cursor->resetIdleAge();
                 return true;
             }
             catch (...) {
@@ -763,7 +773,8 @@ namespace mongo {
                                      max,
                                      indexKeyPattern,
                                      false, /*maxInclusive*/
-                                     true); /*fromMigrate*/
+                                     true,  /*fromMigrate*/
+                                     Collection::NO_LOCKTREE);
             txn.commit();
 
             LOG(0) << "moveChunk deleted " << numDeleted << " documents for "
@@ -1205,7 +1216,7 @@ namespace mongo {
 
                 try {
                     scoped_ptr<ScopedDbConnection> conn(ScopedDbConnection::getInternalScopedDbConnection(shardingState.getConfigServer(), 10.0));
-                    RemoteTransaction txn(conn->conn(), "serializable");
+                    scoped_ptr<RemoteTransaction> txn(new RemoteTransaction(conn->conn(), "serializable"));
 
                     // Check the precondition
                     BSONObjBuilder b;
@@ -1219,6 +1230,7 @@ namespace mongo {
                         error() << "moveChunk commit failed: " << ChunkVersion::fromBSON(found[ChunkType::DEPRECATED_lastmod()])
                                 << " instead of " << maxVersion << migrateLog;
                         error() << "TERMINATING" << migrateLog;
+                        dumpCrashInfo("moveChunk commit failed");
                         dbexit(EXIT_SHARDING_ERROR);
                     }
 
@@ -1236,7 +1248,9 @@ namespace mongo {
                     catch (DBException &e) {
                         warning() << e << migrateLog;
                         error() << "moveChunk error updating the chunk being moved" << migrateLog;
-                        throw e;
+                        txn.reset();
+                        conn->done();
+                        throw;
                     }
 
                     nextVersion = myVersion;
@@ -1272,14 +1286,70 @@ namespace mongo {
                         catch (DBException &e) {
                             warning() << e << migrateLog;
                             error() << "moveChunk error updating chunk on the FROM shard" << migrateLog;
-                            throw e;
+                            txn.reset();
+                            conn->done();
+                            throw;
                         }
                     }
                     else {
                         log() << "moveChunk moved last chunk out for collection '" << ns << "'" << migrateLog;
                     }
 
-                    txn.commit();
+                    {
+                        static const int max_commit_retries = 30;
+                        int retries = max_commit_retries;
+                        bool committed = false;
+                        while (retries-- > 0) {
+                            BSONObj res;
+                            committed = txn->commit(&res);
+                            if (committed) {
+                                break;
+                            }
+                            if (res["code"].isNumber() && res["code"].numberLong() == storage::ASSERT_IDS::TxnNotFoundOnCommit) {
+                                // It may have been committed without giving us a response, or it may have been aborted.
+                                // We need to check whether the effect of our operation can be read.
+                                //
+                                // if the commit made it to the config, we'll see the chunk in the new shard and there's no action
+                                // if the commit did not make it, currently the only way to fix this state is to bounce the mongod so
+                                // that the old state (before migrating) be brought in
+
+                                warning() << "moveChunk commit outcome ongoing" << migrateLog;
+
+                                // look for the chunk in this shard whose version got bumped
+                                // we assume that if that mod made it to the config, the transaction was successful
+                                BSONObj doc = conn->get()->findOne(ChunkType::ConfigNS,
+                                                                   Query(BSON(ChunkType::ns(ns)))
+                                                                   .sort(BSON(ChunkType::DEPRECATED_lastmod() << -1)));
+
+                                ChunkVersion checkVersion =
+                                        ChunkVersion::fromBSON(doc[ChunkType::DEPRECATED_lastmod()]);
+
+                                if (checkVersion.isEquivalentTo(nextVersion)) {
+                                    log() << "moveChunk commit confirmed" << migrateLog;
+                                    committed = true;
+                                    break;
+                                } else {
+                                    error() << "moveChunk commit failed: version is at"
+                                            << checkVersion << " instead of " << nextVersion << migrateLog;
+                                    error() << "TERMINATING" << migrateLog;
+                                    dbexit( EXIT_SHARDING_ERROR );
+                                }
+                            }
+
+                            warning() << "Error committing transaction to finish migration: " << res << migrateLog;
+                            warning() << "Retrying (" << retries << " attempts remaining)" << migrateLog;
+                            sleepmillis(std::min(1 << (max_commit_retries - retries), 1000));
+                        }
+                        if (!committed) {
+                            stringstream ss;
+                            ss << "Couldn't commit transaction to finish migration after " << (max_commit_retries - retries) << " attempts.";
+                            error() << ss.str() << migrateLog;
+                            txn.reset();
+                            conn->done();
+                            msgasserted(17328, ss.str());
+                        }
+                    }
+                    txn.reset();
                     conn->done();
                 }
                 catch (DBException& e) {
@@ -1315,67 +1385,16 @@ namespace mongo {
                         // same as if we catch any other exception
                         error() << "moveChunk failed to get confirmation of commit" << migrateLog;
                         error() << "TERMINATING" << migrateLog;
+                        dumpCrashInfo("moveChunk failed to get confirmation of commit");
                         dbexit(EXIT_SHARDING_ERROR);
                     }
                 }
                 catch (...) {
-                    // TODO(leif): Vanilla, if it fails, waits 10 seconds and does a query to see if somehow the commit made it through anyway.  Maybe we need such a mechanism too?
                     error() << "moveChunk failed to get confirmation of commit" << migrateLog;
                     error() << "TERMINATING" << migrateLog;
+                    dumpCrashInfo("moveChunk failed to get confirmation of commit");
                     dbexit(EXIT_SHARDING_ERROR);
                 }
-
-                // Vanilla does the following at the end.  Keep this code around as notes until we know we don't need it.
-#if 0
-                if ( ! ok ) {
-
-                    // this could be a blip in the connectivity
-                    // wait out a few seconds and check if the commit request made it
-                    //
-                    // if the commit made it to the config, we'll see the chunk in the new shard and there's no action
-                    // if the commit did not make it, currently the only way to fix this state is to bounce the mongod so
-                    // that the old state (before migrating) be brought in
-
-                    warning() << "moveChunk commit outcome ongoing: " << cmd << " for command :" << cmdResult << migrateLog;
-                    sleepsecs( 10 );
-
-                    try {
-                        scoped_ptr<ScopedDbConnection> conn(
-                                ScopedDbConnection::getInternalScopedDbConnection(
-                                        shardingState.getConfigServer(),
-                                        10.0 ) );
-
-                        // look for the chunk in this shard whose version got bumped
-                        // we assume that if that mod made it to the config, the applyOps was successful
-                        BSONObj doc = conn->get()->findOne(ChunkType::ConfigNS,
-                                                           Query(BSON(ChunkType::ns(ns)))
-                                                               .sort(BSON(ChunkType::DEPRECATED_lastmod() << -1)));
-
-                        ChunkVersion checkVersion =
-                            ChunkVersion::fromBSON(doc[ChunkType::DEPRECATED_lastmod()]);
-
-                        if ( checkVersion.isEquivalentTo( nextVersion ) ) {
-                            log() << "moveChunk commit confirmed" << migrateLog;
-                            errmsg.clear();
-
-                        }
-                        else {
-                            error() << "moveChunk commit failed: version is at"
-                                            << checkVersion << " instead of " << nextVersion << migrateLog;
-                            error() << "TERMINATING" << migrateLog;
-                            dbexit( EXIT_SHARDING_ERROR );
-                        }
-
-                        conn->done();
-
-                    }
-                    catch ( ... ) {
-                        error() << "moveChunk failed to get confirmation of commit" << migrateLog;
-                        error() << "TERMINATING" << migrateLog;
-                        dbexit( EXIT_SHARDING_ERROR );
-                    }
-                }
-#endif
 
                 migrateFromStatus.setInCriticalSection( false );
 
@@ -1383,7 +1402,7 @@ namespace mongo {
                 configServer.logChange( "moveChunk.commit" , ns , chunkInfo );
             }
 
-            migrateFromStatus.done();
+            migrateFromStatus.done(false);
             timing.done(5);
 
             // 6.
@@ -1419,6 +1438,21 @@ namespace mongo {
 
     class MigrateStatus {
         long long _lastAppliedMigrateLogID;
+
+        template<typename T>
+        class CounterResetter : boost::noncopyable {
+            T &_val;
+            T _was;
+            bool _done;
+          public:
+            CounterResetter(T &val) : _val(val), _was(val), _done(false) {}
+            ~CounterResetter() {
+                if (!_done) {
+                    _val = _was;
+                }
+            }
+            void setDone() { _done = true; }
+        };
 
     public:
         
@@ -1464,6 +1498,7 @@ namespace mongo {
             auto_ptr<DBClientCursor> mlogCursor(conn->query(MigrateFromStatus::MIGRATE_LOG_NS,
                                                             QUERY("_id" << GTE << _lastAppliedMigrateLogID).hint(BSON("_id" << 1)),
                                                             0, 0, 0, 0));
+            massert(17320, "migratelog cursor query returned NULL, aborting migration", mlogCursor.get() != NULL);
             // Check that what we thought was the last one really is the last one and we don't have a gap.
             if (_lastAppliedMigrateLogID >= 0) {
                 BSONObj op = mlogCursor->nextSafe();
@@ -1471,51 +1506,135 @@ namespace mongo {
             }
             while (mlogCursor->more()) {
                 LOCK_REASON(lockReason, "sharding: applying mods for migrate");
-                scoped_ptr<Client::ReadContext> ctxp(new Client::ReadContext(ns, lockReason));
-                scoped_ptr<Client::Transaction> txnp(new Client::Transaction(DB_SERIALIZABLE));
-                while (mlogCursor->moreInCurrentBatch()) {
-                    BSONObj op = mlogCursor->nextSafe();
-                    dassert(op["_id"].Long() == _lastAppliedMigrateLogID + 1);
-                    if (op.hasField("a")) {
-                        if (!txnp) {
-                            ctxp.reset(new Client::ReadContext(ns, lockReason));
-                            txnp.reset(new Client::Transaction(DB_SERIALIZABLE));
-                        }
-                        SpillableVectorIterator it(op, conn.conn(), MigrateFromStatus::MIGRATE_LOG_REF_NS);
-                        while (it.more()) {
-                            OpLogHelpers::applyOperationFromOplog(it.next());
-                            if (state == CATCHUP) {
-                                numCatchup++;
-                            } else {
-                                numSteady++;
+                try {
+                    scoped_ptr<Client::ReadContext> ctxp(new Client::ReadContext(ns, lockReason));
+                    scoped_ptr<Client::Transaction> txnp(new Client::Transaction(DB_SERIALIZABLE));
+                    scoped_ptr<DBClientCursor::BatchResetter> br(new DBClientCursor::BatchResetter(*mlogCursor));
+                    scoped_ptr<CounterResetter<long long> > mlidResetter(new CounterResetter<long long>(_lastAppliedMigrateLogID));
+                    scoped_ptr<CounterResetter<long long> > catchupResetter(new CounterResetter<long long>(numCatchup));
+                    scoped_ptr<CounterResetter<long long> > steadyResetter(new CounterResetter<long long>(numSteady));
+                    while (mlogCursor->moreInCurrentBatch()) {
+                        BSONObj op = mlogCursor->nextSafe();
+                        dassert(op["_id"].Long() == _lastAppliedMigrateLogID + 1);
+                        if (op.hasField("a")) {
+                            if (!txnp) {
+                                ctxp.reset(new Client::ReadContext(ns, lockReason));
+                                txnp.reset(new Client::Transaction(DB_SERIALIZABLE));
+                                br.reset(new DBClientCursor::BatchResetter(*mlogCursor));
+                                mlidResetter.reset(new CounterResetter<long long>(_lastAppliedMigrateLogID));
+                                catchupResetter.reset(new CounterResetter<long long>(numCatchup));
+                                steadyResetter.reset(new CounterResetter<long long>(numSteady));
                             }
-                        }
-                    } else {
-                        if (txnp) {
-                            txnp->commit();
-                            txnp.reset();
-                            ctxp.reset();
-                        }
-                        SpillableVectorIterator it(op, conn.conn(), MigrateFromStatus::MIGRATE_LOG_REF_NS);
-                        while (it.more()) {
-                            LOCK_REASON(lockReasonInner, "sharding: applying mods from migratelog.refs for migrate");
-                            Client::ReadContext ctx(ns, lockReasonInner);
-                            Client::Transaction txn(DB_SERIALIZABLE);
-                            while (it.moreInCurrentBatch()) {
-                                OpLogHelpers::applyOperationFromOplog(it.next());
+                            SpillableVectorIterator it(op, conn.conn(), MigrateFromStatus::MIGRATE_LOG_REF_NS);
+                            while (it.more()) {
+                                OplogHelpers::applyOperationFromOplog(it.next());
                                 if (state == CATCHUP) {
                                     numCatchup++;
                                 } else {
                                     numSteady++;
                                 }
                             }
-                            txn.commit();
+                        } else {
+                            if (txnp) {
+                                txnp->commit();
+                                br->setDone();
+                                mlidResetter->setDone();
+                                catchupResetter->setDone();
+                                steadyResetter->setDone();
+
+                                txnp.reset();
+                                ctxp.reset();
+                                br.reset();
+                                mlidResetter.reset();
+                                catchupResetter.reset();
+                                steadyResetter.reset();
+                            }
+                            SpillableVectorIterator it(op, conn.conn(), MigrateFromStatus::MIGRATE_LOG_REF_NS);
+                            while (it.more()) {
+                                LOCK_REASON(lockReasonInner, "sharding: applying mods from migratelog.refs for migrate");
+                                try {
+                                    Client::ReadContext ctx(ns, lockReasonInner);
+                                    Client::Transaction txn(DB_SERIALIZABLE);
+                                    SpillableVectorIterator::BatchResetter itbr(it);
+                                    CounterResetter<long long> cr(numCatchup);
+                                    CounterResetter<long long> sr(numSteady);
+                                    while (it.moreInCurrentBatch()) {
+                                        OplogHelpers::applyOperationFromOplog(it.next());
+                                        if (state == CATCHUP) {
+                                            numCatchup++;
+                                        } else {
+                                            numSteady++;
+                                        }
+                                    }
+                                    txn.commit();
+                                    itbr.setDone();
+                                    cr.setDone();
+                                    sr.setDone();
+                                } catch (RetryWithWriteLock) {
+                                    Client::WriteContext ctx(ns, lockReasonInner);
+                                    Client::Transaction txn(DB_SERIALIZABLE);
+                                    while (it.moreInCurrentBatch()) {
+                                        OplogHelpers::applyOperationFromOplog(it.next());
+                                        if (state == CATCHUP) {
+                                            numCatchup++;
+                                        } else {
+                                            numSteady++;
+                                        }
+                                    }
+                                    txn.commit();
+                                }
+                            }
                         }
+                        _lastAppliedMigrateLogID = op["_id"].Long();
                     }
-                    _lastAppliedMigrateLogID = op["_id"].Long();
-                }
-                if (txnp) {
-                    txnp->commit();
+                    if (txnp) {
+                        txnp->commit();
+                        br->setDone();
+                        mlidResetter->setDone();
+                        catchupResetter->setDone();
+                        steadyResetter->setDone();
+                    }
+                } catch (RetryWithWriteLock) {
+                    // This case is much simpler because we hopefully only have a normal op, not a
+                    // spilled op (if that got RetryWithWriteLock, it should have been handled in
+                    // the inner try/catch block).  We know we won't yield for this entire batch, so
+                    // we just blast right through it.
+                    //
+                    // WARNING: Normally, code like this would be factored out.  If something
+                    // changes in the above try block, something should probably change here too.
+                    Client::WriteContext ctx(ns, lockReason);
+                    Client::Transaction txn(DB_SERIALIZABLE);
+                    int opsHandled = 0;
+                    while (mlogCursor->moreInCurrentBatch()) {
+                        BSONObj op = mlogCursor->nextSafe();
+                        dassert(op["_id"].Long() == _lastAppliedMigrateLogID + 1);
+                        if (!op.hasField("a")) {
+                            if (opsHandled == 0) {
+                                warning() << "moveChunk: transferMods found a spilled migratelog operation in a write lock,"
+                                          << " but hasn't processed anything properly yet." << migrateLog;
+                                std::stringstream ss;
+                                ss << "Aborting migration to prevent infinite loop in transferMods due to op " << op;
+                                warning() << ss.str() << migrateLog;
+                                msgasserted(17327, ss.str());
+                            }
+                            LOG(0) << "moveChunk: transferMods found a spilled migratelog operation in a write lock,"
+                                   << " stopping here and returning to normal transferMods implementation." << migrateLog;
+                            mlogCursor->putBack(op);
+                            break;
+                        }
+                        SpillableVectorIterator it(op, conn.conn(), MigrateFromStatus::MIGRATE_LOG_REF_NS);
+                        while (it.more()) {
+                            OplogHelpers::applyOperationFromOplog(it.next());
+                            if (state == CATCHUP) {
+                                numCatchup++;
+                            } else {
+                                numSteady++;
+                            }
+                        }
+                        _lastAppliedMigrateLogID = op["_id"].Long();
+                        opsHandled++;
+                    }
+                    txn.commit();
                 }
                 GTID lastGTID = cc().getLastOp();
                 for (Timer t; !opReplicatedEnough(lastGTID); sleepmillis(20)) {
@@ -1528,6 +1647,64 @@ namespace mongo {
                 }
             }
             return cc().getLastOp();
+        }
+
+        /**
+         * We may need to handle RetryWithWriteLock inside this code, so it is factored out of _go
+         * below.
+         */
+        void lockedMigrateInsertFirstBatch(const BSONObj &firstBatch, uint64_t insertFlags) {
+            Client::Transaction txn(DB_SERIALIZABLE);
+            Collection *cl = getCollection(ns);
+            massert(17318, "collection must exist during migration", cl);
+            for (BSONObjIterator it(firstBatch); it.more(); ++it) {
+                BSONObj obj = (*it).Obj();
+                insertOneObject(cl, obj, insertFlags);
+                OplogHelpers::logInsert(ns.c_str(), obj, true);
+                numCloned++;
+                clonedBytes += obj.objsize();
+            }
+            txn.commit();
+        }
+
+        void lockedMigrateInsertBatch(DBClientCursorBatchIterator &iter, uint64_t insertFlags) {
+            Client::Transaction txn(DB_SERIALIZABLE);
+            Collection *cl = getCollection(ns);
+            massert(17319, "collection must exist during migration", cl);
+            while (iter.moreInCurrentBatch()) {
+                BSONObj obj = iter.nextSafe();
+                insertOneObject(cl, obj, insertFlags);
+                OplogHelpers::logInsert(ns.c_str(), obj, true);
+                numCloned++;
+                clonedBytes += obj.objsize();
+            }
+            txn.commit();
+        }
+
+        bool lockedMigrateHandleLegacyBatch(const BSONObj &arr) {
+            Client::Transaction txn(DB_SERIALIZABLE);
+            int thisTime = 0;
+
+            for (BSONObjIterator i(arr); i.more(); i++) {
+                BSONObj o = (*i).Obj();
+                BSONObj id = o["_id"].wrap();
+                OpDebug debug;
+                updateObjects(ns.c_str(),
+                              o,
+                              id,
+                              true,  // upsert
+                              false, // multi
+                              true   // fromMigrate
+                              );
+
+                thisTime++;
+                numCloned++;
+                clonedBytes += o.objsize();
+            }
+
+            txn.commit();
+
+            return thisTime != 0;
         }
 
         void go() {
@@ -1660,46 +1837,51 @@ namespace mongo {
                     massert(17225, mongoutils::str::stream() << "expected cursor ns " << ns << ", got " << cursorObj["ns"].Stringdata(),
                             cursorObj["ns"].Stringdata() == ns);
 
+                    uint64_t insertFlags = Collection::NO_LOCKTREE;
+                    if (!migrateUniqueChecks) {
+                        insertFlags |= Collection::NO_UNIQUE_CHECKS;
+                    }
+
                     LOCK_REASON(lockReason, "sharding: cloning documents on recipient for migrate");
-                    {
+                    try {
                         Client::ReadContext ctx(ns, lockReason);
-                        Client::Transaction txn(DB_SERIALIZABLE);
-                        for (BSONObjIterator it(cursorObj["firstBatch"].Obj()); it.more(); ++it) {
-                            BSONObj obj = (*it).Obj();
-                            updateObjects(ns.c_str(), obj, obj["_id"].wrap(),
-                                          true,   // upsert
-                                          false,  // multi
-                                          true,   // logop
-                                          true);  // fromMigrate
-                            numCloned++;
-                            clonedBytes += obj.objsize();
-                        }
-                        txn.commit();
+                        CounterResetter<long long> numClonedResetter(numCloned);
+                        CounterResetter<long long> clonedBytesResetter(clonedBytes);
+
+                        lockedMigrateInsertFirstBatch(cursorObj["firstBatch"].Obj(), insertFlags);
+
+                        numClonedResetter.setDone();
+                        clonedBytesResetter.setDone();
+                    } catch (RetryWithWriteLock) {
+                        Client::WriteContext ctx(ns, lockReason);
+
+                        lockedMigrateInsertFirstBatch(cursorObj["firstBatch"].Obj(), insertFlags);
                     }
 
                     for (DBClientCursor cursor(conn.get(), ns, cursorObj["id"].Long(), 0, 0);
                          cursor.more(); ) {
-                        Client::ReadContext ctx(ns, lockReason);
-                        Client::Transaction txn(DB_SERIALIZABLE);
-                        while (cursor.moreInCurrentBatch()) {
-                            BSONObj obj = cursor.nextSafe();
-                            updateObjects(ns.c_str(), obj, obj["_id"].wrap(),
-                                          true,   // upsert
-                                          false,  // multi
-                                          true,   // logop
-                                          true);  // fromMigrate
-                            numCloned++;
-                            clonedBytes += obj.objsize();
+                        try {
+                            Client::ReadContext ctx(ns, lockReason);
+                            CounterResetter<long long> numClonedResetter(numCloned);
+                            CounterResetter<long long> clonedBytesResetter(clonedBytes);
+                            DBClientCursor::BatchResetter br(cursor);
+                            DBClientCursorBatchIterator iter(cursor);
+
+                            lockedMigrateInsertBatch(iter, insertFlags);
+
+                            numClonedResetter.setDone();
+                            clonedBytesResetter.setDone();
+                            br.setDone();
+                        } catch (RetryWithWriteLock) {
+                            Client::WriteContext ctx(ns, lockReason);
+                            DBClientCursorBatchIterator iter(cursor);
+
+                            lockedMigrateInsertBatch(iter, insertFlags);
                         }
-                        txn.commit();
                     }
                 } else {
                     // The old path, for compatibility with older TokuMX servers.
                     LOG(0) << "moveChunk using old migrate path, please upgrade all shards soon" << migrateLog;
-
-                    LOCK_REASON(lockReason, "sharding: cloning documents on recipient for migrate, using old _migrateClone");
-                    Client::ReadContext ctx(ns, lockReason);
-                    Client::Transaction txn(DB_SERIALIZABLE);
 
                     while ( true ) {
                         BSONObj res;
@@ -1713,32 +1895,26 @@ namespace mongo {
                         }
 
                         BSONObj arr = res["objects"].Obj();
-                        int thisTime = 0;
+                        bool nonempty;
+                        LOCK_REASON(lockReason, "sharding: cloning documents on recipient for migrate, using old _migrateClone");
+                        try {
+                            Client::ReadContext ctx(ns, lockReason);
+                            CounterResetter<long long> numClonedResetter(numCloned);
+                            CounterResetter<long long> clonedBytesResetter(clonedBytes);
 
-                        BSONObjIterator i( arr );
-                        while( i.more() ) {
-                            BSONObj o = i.next().Obj();
-                            BSONObj id = o["_id"].wrap();
-                            OpDebug debug;
-                            updateObjects(ns.c_str(),
-                                          o,
-                                          id,
-                                          true,  // upsert
-                                          false, // multi
-                                          true,  // logop
-                                          true   // fromMigrate
-                                          );
+                            nonempty = lockedMigrateHandleLegacyBatch(arr);
 
-                            thisTime++;
-                            numCloned++;
-                            clonedBytes += o.objsize();
+                            numClonedResetter.setDone();
+                            clonedBytesResetter.setDone();
+                        } catch (RetryWithWriteLock) {
+                            Client::WriteContext ctx(ns, lockReason);
+
+                            nonempty = lockedMigrateHandleLegacyBatch(arr);
                         }
-
-                        if ( thisTime == 0 )
+                        if (!nonempty) {
                             break;
+                        }
                     }
-
-                    txn.commit();
                 }
 
                 timing.done(3);
@@ -1883,7 +2059,7 @@ namespace mongo {
                 BSONObj mod = it->Obj();
                 vector<BSONElement> logObjElts = mod["a"].Array();
                 for (vector<BSONElement>::const_iterator lit = logObjElts.begin(); lit != logObjElts.end(); ++lit) {
-                    OpLogHelpers::applyOperationFromOplog(lit->Obj());
+                    OplogHelpers::applyOperationFromOplog(lit->Obj());
                 }
             }
 
@@ -1982,7 +2158,7 @@ namespace mongo {
     public:
         RecvChunkStartCommand() : ChunkCommandHelper( "_recvChunkStart" ) {}
 
-        virtual LockType locktype() const { return WRITE; }  // this is so don't have to do locking internally
+        virtual LockType locktype() const { return OPLOCK; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
@@ -1990,7 +2166,7 @@ namespace mongo {
             actions.addAction(ActionType::_recvChunkStart);
             out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
         }
-        bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
 
             if ( migrateStatus.getActive() ) {
                 errmsg = "migrate already in progress";
@@ -1999,6 +2175,12 @@ namespace mongo {
             
             if ( ! configServer.ok() )
                 ShardingState::initialize(cmdObj["configServer"].String());
+
+            // This used to be over the entire _recvChunkStart command, but
+            // ShardingState::initialize will take a GlobalWrite lock in order to enable sharding,
+            // so we can't take the lock until after that.
+            LOCK_REASON(lockReason, "sharding: _recvChunkStart");
+            Lock::DBWrite lk(dbname, lockReason);
 
             migrateStatus.prepare();
 
