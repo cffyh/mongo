@@ -458,19 +458,15 @@ namespace mongo {
                 }
             }
 
-            void appendPanic(BSONObjBuilder &result, bool evenIfEmpty) const {
-                if (_panic != 0 || evenIfEmpty) {
-                    result.append("panic code", (long long) _panic);
-                    result.append("panic string", _panic_string);
-                }
+            void appendPanic(BSONObjBuilder &result) const {
+                result.append("panic code", (long long) _panic);
+                result.append("panic string", _panic_string);
             }
 
-            void appendFilesystem(BSONObjBuilder &result, bool evenIfGreen) const {
+            void appendFilesystem(BSONObjBuilder &result) const {
                 switch (_redzone_state) {
                     case FS_GREEN:
-                        if (evenIfGreen) {
-                            result.append("filesystem status", "OK");
-                        }
+                        result.append("filesystem status", "OK");
                         break;
                     case FS_YELLOW:
                         result.append("filesystem status", "Getting full...");
@@ -490,20 +486,16 @@ namespace mongo {
                 }
             }
 
-            static void appendRow(BSONObjBuilder &result, const StringData &field, TOKU_ENGINE_STATUS_ROW row, bool ifZero, int scale = 1) {
+            static void appendRow(BSONObjBuilder &result, const StringData &field, TOKU_ENGINE_STATUS_ROW row, int scale = 1) {
                 switch (row->type) {
                     case FS_STATE:
                     case UINT64:
-                        if (ifZero || row->value.num != 0) {
-                            result.appendNumber(field, (long long) row->value.num / scale);
-                        }
+                        result.appendNumber(field, (long long) row->value.num / scale);
                         break;
                     case CHARSTR:
                         {
                             StringData s(row->value.str);
-                            if (ifZero || !s.empty()) {
-                                result.append(field, s);
-                            }
+                            result.append(field, s);
                         }
                         break;
                     case UNIXTIME:
@@ -513,24 +505,18 @@ namespace mongo {
                         }
                         break;
                     case TOKUTIME:
-                        if (ifZero || row->value.num != 0) {
-                            result.appendNumber(field, tokutime_to_seconds(row->value.num));
-                        }
+                        result.appendNumber(field, tokutime_to_seconds(row->value.num));
                         break;
                     case PARCOUNT:
                         {
                             uint64_t v = read_partitioned_counter(row->value.parcount);
-                            if (ifZero || v != 0) {
-                                result.appendNumber(field, (long long) v / scale);
-                            }
+                            result.appendNumber(field, (long long) v / scale);
                         }
                         break;
                     case DOUBLE:
                         {
                             double v = row->value.dnum;
-                            if (ifZero || v != 0) {
-                                result.appendNumber(field, v);
-                            }
+                            result.appendNumber(field, v);
                         }
                         break;
                     default:
@@ -544,18 +530,18 @@ namespace mongo {
             }
 
             void appendInfo(BSONObjBuilder &result) {
-                appendPanic(result, true);
-                appendFilesystem(result, true);
+                appendPanic(result);
+                appendFilesystem(result);
                 for (uint64_t i = 0; i < _num_rows; ++i) {
-                    appendRow(result, _rows[i].keyname, &_rows[i], true);
+                    appendRow(result, _rows[i].keyname, &_rows[i]);
                 }
             }
 
-            void appendInfo(BSONObjBuilder &result, const StringData &field, const StringData &key, bool ifZero, int scale = 1) const {
+            void appendInfo(BSONObjBuilder &result, const StringData &field, const StringData &key, int scale = 1) const {
                 // well, this is annoying
                 for (uint64_t i = 0; i < _num_rows; ++i) {
                     if (key == _rows[i].keyname) {
-                        appendRow(result, field, &_rows[i], ifZero, scale);
+                        appendRow(result, field, &_rows[i], scale);
                         break;
                     }
                 }
@@ -589,9 +575,10 @@ namespace mongo {
                         switch (row->type) {
                         case TOKUTIME:
                             return tokutime_to_seconds(row->value.num);
+                        case UNIXTIME:
+                            return static_cast<double>(*reinterpret_cast<const time_t *>(&row->value.num));
                         case DOUBLE:
                         case CHARSTR:
-                        case UNIXTIME:
                         case FS_STATE:
                         case UINT64:
                         case PARCOUNT:
@@ -608,6 +595,34 @@ namespace mongo {
             status.fetch();
             status.appendInfo(result);
         }
+
+        class NestedBuilder : boost::noncopyable {
+          public:
+            class Stack : public std::stack<BSONObjBuilder *> {
+                BSONObjBuilder _bottom;
+              public:
+                Stack() {
+                    push(&_bottom);
+                }
+                BSONObjBuilder &b() { return *top(); }
+                operator BSONObjBuilder&() { return b(); }
+            };
+
+            NestedBuilder(Stack &stack, const StringData &name)
+                    : _stack(stack), _b(_stack.b().subobjStart(name))
+            {
+                _stack.push(&_b);
+            }
+
+            ~NestedBuilder() {
+                _stack.pop();
+                _b.doneFast();
+            }
+
+          private:
+            Stack &_stack;
+            BSONObjBuilder _b;
+        };
 
         class FractalTreeSSS : public ServerStatusSection {
           public:
@@ -628,44 +643,32 @@ namespace mongo {
                     }
                 }
 
-                BSONObjBuilder result;
+                NestedBuilder::Stack result;
 
                 FractalTreeEngineStatus status;
                 status.fetch();
 
-                status.appendPanic(result, false);
-                status.appendFilesystem(result, false);
                 {
-                    BSONObjBuilder b(result.subobjStart("fsync"));
-                    status.appendInfo(b, "count", "FS_FSYNC_COUNT", true);
-                    status.appendInfo(b, "time", "FS_FSYNC_TIME", true);
-                    {
-                        BSONObjBuilder lwb;
-                        status.appendInfo(lwb, "count", "FS_LONG_FSYNC_COUNT", false);
-                        status.appendInfo(lwb, "time", "FS_LONG_FSYNC_TIME", false);
-                        BSONObj lw = lwb.done();
-                        if (!lw.isEmpty()) {
-                            b.append("longFsync", lw);
-                        }
-                    }
-                    b.doneFast();
+                    NestedBuilder _n1(result, "fsync");
+                    status.appendInfo(result, "count", "FS_FSYNC_COUNT");
+                    status.appendInfo(result, "time", "FS_FSYNC_TIME");
                 }
                 {
-                    BSONObjBuilder b(result.subobjStart("log"));
-                    status.appendInfo(b, "bytesWritten", "LOGGER_BYTES_WRITTEN", true, scale);
-                    b.doneFast();
+                    NestedBuilder _n1(result, "log");
+                    status.appendInfo(result, "count", "LOGGER_NUM_WRITES");
+                    status.appendInfo(result, "time", "LOGGER_TOKUTIME_WRITES");
+                    status.appendInfo(result, "bytes", "LOGGER_BYTES_WRITTEN", scale);
                 }
                 {
-                    BSONObjBuilder b(result.subobjStart("cachetable"));
+                    NestedBuilder _n1(result, "cachetable");
                     {
-                        BSONObjBuilder b2(b.subobjStart("size"));
-                        status.appendInfo(b2, "current", "CT_SIZE_CURRENT", true, scale);
-                        status.appendInfo(b2, "writing", "CT_SIZE_WRITING", true, scale);
-                        status.appendInfo(b2, "limit", "CT_SIZE_LIMIT", true, scale);
-                        b2.doneFast();
+                        NestedBuilder _n2(result, "size");
+                        status.appendInfo(result, "current", "CT_SIZE_CURRENT", scale);
+                        status.appendInfo(result, "writing", "CT_SIZE_WRITING", scale);
+                        status.appendInfo(result, "limit", "CT_SIZE_LIMIT", scale);
                     }
                     {
-                        BSONObjBuilder b2(b.subobjStart("miss"));
+                        NestedBuilder _n2(result, "miss");
                         uint64_t fullMisses = status.getInteger("CT_MISS");
                         // unfortunately, this is a uint64 when it's actually a tokutime...
                         double fullMisstime = tokutime_to_seconds(status.getInteger("CT_MISSTIME"));
@@ -693,121 +696,182 @@ namespace mongo {
                             partialMisstime += status.getDuration(partialMisstimeKeys[i]);
                         }
 
-                        b2.append("count", fullMisses + partialMisses);
-                        b2.append("time", fullMisstime + partialMisstime);
+                        result.b().append("count", fullMisses + partialMisses);
+                        result.b().append("time", fullMisstime + partialMisstime);
                         {
-                            BSONObjBuilder b3(b2.subobjStart("full"));
-                            b3.append("count", fullMisses);
-                            b3.append("time", fullMisstime);
-                            b3.doneFast();
+                            NestedBuilder _n3(result, "full");
+                            result.b().append("count", fullMisses);
+                            result.b().append("time", fullMisstime);
                         }
                         {
-                            BSONObjBuilder b3(b2.subobjStart("partial"));
-                            b3.append("count", partialMisses);
-                            b3.append("time", partialMisstime);
-                            b3.doneFast();
+                            NestedBuilder _n3(result, "partial");
+                            result.b().append("count", partialMisses);
+                            result.b().append("time", partialMisstime);
                         }
-                        b2.doneFast();
                     }
                     {
-                        BSONObjBuilder b2(b.subobjStart("evictions"));
+                        NestedBuilder _n2(result, "evictions");
                         {
-                            BSONObjBuilder b3(b.subobjStart("partial"));
+                            NestedBuilder _n3(result, "partial");
                             {
-                                BSONObjBuilder b4(b.subobjStart("nonleaf"));
-                                status.appendInfo(b4, "count", "FT_PARTIAL_EVICTIONS_NONLEAF", true);
-                                status.appendInfo(b4, "bytes", "FT_PARTIAL_EVICTIONS_NONLEAF_BYTES", true, scale);
-                                b4.doneFast();
+                                NestedBuilder _n4(result, "nonleaf");
+                                {
+                                    NestedBuilder _n5(result, "clean");
+                                    status.appendInfo(result, "count", "FT_PARTIAL_EVICTIONS_NONLEAF");
+                                    status.appendInfo(result, "bytes", "FT_PARTIAL_EVICTIONS_NONLEAF_BYTES", scale);
+                                }
                             }
                             {
-                                BSONObjBuilder b4(b.subobjStart("leaf"));
-                                status.appendInfo(b4, "count", "FT_PARTIAL_EVICTIONS_LEAF", true);
-                                status.appendInfo(b4, "bytes", "FT_PARTIAL_EVICTIONS_LEAF_BYTES", true, scale);
-                                b4.doneFast();
+                                NestedBuilder _n4(result, "leaf");
+                                {
+                                    NestedBuilder _n5(result, "clean");
+                                    status.appendInfo(result, "count", "FT_PARTIAL_EVICTIONS_LEAF");
+                                    status.appendInfo(result, "bytes", "FT_PARTIAL_EVICTIONS_LEAF_BYTES", scale);
+                                }
                             }
-                            b3.doneFast();
                         }
                         {
-                            BSONObjBuilder b3(b.subobjStart("full"));
+                            NestedBuilder _n3(result, "full");
                             {
-                                BSONObjBuilder b4(b.subobjStart("nonleaf"));
-                                status.appendInfo(b4, "count", "FT_FULL_EVICTIONS_NONLEAF", true);
-                                status.appendInfo(b4, "bytes", "FT_FULL_EVICTIONS_NONLEAF_BYTES", true);
+                                NestedBuilder _n4(result, "nonleaf");
                                 {
-                                    BSONObjBuilder b5(b.subobjStart("dirty"));
-                                    status.appendInfo(b5, "count", "FT_DISK_FLUSH_NONLEAF", true);
-                                    status.appendInfo(b5, "bytes", "FT_DISK_FLUSH_NONLEAF_UNCOMPRESSED_BYTES", true, scale);
-                                    status.appendInfo(b5, "time", "FT_DISK_FLUSH_NONLEAF_TOKUTIME", true);
-                                    b5.doneFast();
+                                    NestedBuilder _n5(result, "clean");
+                                    status.appendInfo(result, "count", "FT_FULL_EVICTIONS_NONLEAF");
+                                    status.appendInfo(result, "bytes", "FT_FULL_EVICTIONS_NONLEAF_BYTES", scale);
                                 }
-                                b4.doneFast();
+                                {
+                                    NestedBuilder _n5(result, "dirty");
+                                    status.appendInfo(result, "count", "FT_DISK_FLUSH_NONLEAF");
+                                    status.appendInfo(result, "bytes", "FT_DISK_FLUSH_NONLEAF_UNCOMPRESSED_BYTES", scale);
+                                    status.appendInfo(result, "time", "FT_DISK_FLUSH_NONLEAF_TOKUTIME");
+                                }
                             }
                             {
-                                BSONObjBuilder b4(b.subobjStart("leaf"));
-                                status.appendInfo(b4, "count", "FT_FULL_EVICTIONS_LEAF", true);
-                                status.appendInfo(b4, "bytes", "FT_FULL_EVICTIONS_LEAF_BYTES", true);
+                                NestedBuilder _n4(result, "leaf");
                                 {
-                                    BSONObjBuilder b5(b.subobjStart("dirty"));
-                                    status.appendInfo(b5, "count", "FT_DISK_FLUSH_LEAF", true);
-                                    status.appendInfo(b5, "bytes", "FT_DISK_FLUSH_LEAF_UNCOMPRESSED_BYTES", true, scale);
-                                    status.appendInfo(b5, "time", "FT_DISK_FLUSH_LEAF_TOKUTIME", true);
-                                    b5.doneFast();
+                                    NestedBuilder _n5(result, "clean");
+                                    status.appendInfo(result, "count", "FT_FULL_EVICTIONS_LEAF");
+                                    status.appendInfo(result, "bytes", "FT_FULL_EVICTIONS_LEAF_BYTES", scale);
                                 }
-                                b4.doneFast();
+                                {
+                                    NestedBuilder _n5(result, "dirty");
+                                    status.appendInfo(result, "count", "FT_DISK_FLUSH_LEAF");
+                                    status.appendInfo(result, "bytes", "FT_DISK_FLUSH_LEAF_UNCOMPRESSED_BYTES", scale);
+                                    status.appendInfo(result, "time", "FT_DISK_FLUSH_LEAF_TOKUTIME");
+                                }
                             }
-                            b3.doneFast();
-                        }
-                        b2.doneFast();
-                    }
-                    {
-                        BSONObjBuilder lwb;
-                        status.appendInfo(lwb, "count", "CT_LONG_WAIT_PRESSURE_COUNT", false);
-                        status.appendInfo(lwb, "time", "CT_LONG_WAIT_PRESSURE_TIME", false);
-                        BSONObj lw = lwb.done();
-                        if (!lw.isEmpty()) {
-                            b.append("longWaitCachePressure", lw);
                         }
                     }
-                    b.doneFast();
                 }
                 {
-                    BSONObjBuilder b(result.subobjStart("locktree"));
+                    NestedBuilder _n1(result, "checkpoint");
+                    status.appendInfo(result, "count", "CP_CHECKPOINT_COUNT");
+                    // CP_TIME_CHECKPOINT_DURATION is a time_t but we don't want it displayed as a date
+                    result.b().append("time", status.getDuration("CP_TIME_CHECKPOINT_DURATION"));
+                    status.appendInfo(result, "lastBegin", "CP_TIME_LAST_CHECKPOINT_BEGIN");
                     {
-                        BSONObjBuilder b2(b.subobjStart("size"));
-                        status.appendInfo(b2, "current", "LTM_SIZE_CURRENT", true, scale);
-                        status.appendInfo(b2, "limit", "LTM_SIZE_LIMIT", true, scale);
-                        b2.doneFast();
+                        NestedBuilder _n2(result, "lastComplete");
+                        status.appendInfo(result, "begin", "CP_TIME_LAST_CHECKPOINT_BEGIN_COMPLETE");
+                        status.appendInfo(result, "end", "CP_TIME_LAST_CHECKPOINT_END");
+                        result.b().append("time", status.getDuration("CP_TIME_CHECKPOINT_DURATION_LAST"));
                     }
-                    status.appendInfo(b, "requestsPending", "LTM_LOCK_REQUESTS_PENDING", false);
                     {
-                        BSONObjBuilder lwb;
-                        status.appendInfo(lwb, "count", "LTM_LONG_WAIT_COUNT", false);
-                        status.appendInfo(lwb, "time", "LTM_LONG_WAIT_TIME", false);
-                        BSONObj lw = lwb.done();
-                        if (!lw.isEmpty()) {
-                            b.append("longWait", lw);
+                        NestedBuilder _n2(result, "begin");
+                        status.appendInfo(result, "time", "CP_BEGIN_TIME");
+                    }
+                    {
+                        NestedBuilder _n2(result, "write");
+                        {
+                            NestedBuilder _n3(result, "nonleaf");
+                            status.appendInfo(result, "count", "FT_DISK_FLUSH_NONLEAF_FOR_CHECKPOINT");
+                            status.appendInfo(result, "time", "FT_DISK_FLUSH_NONLEAF_TOKUTIME_FOR_CHECKPOINT");
+                            {
+                                NestedBuilder _n4(result, "bytes");
+                                status.appendInfo(result, "uncompressed", "FT_DISK_FLUSH_NONLEAF_UNCOMPRESSED_BYTES_FOR_CHECKPOINT", scale);
+                                status.appendInfo(result, "compressed", "FT_DISK_FLUSH_NONLEAF_BYTES_FOR_CHECKPOINT", scale);
+                            }
+                        }
+                        {
+                            NestedBuilder _n3(result, "leaf");
+                            status.appendInfo(result, "count", "FT_DISK_FLUSH_LEAF_FOR_CHECKPOINT");
+                            status.appendInfo(result, "time", "FT_DISK_FLUSH_LEAF_TOKUTIME_FOR_CHECKPOINT");
+                            {
+                                NestedBuilder _n4(result, "bytes");
+                                status.appendInfo(result, "uncompressed", "FT_DISK_FLUSH_LEAF_UNCOMPRESSED_BYTES_FOR_CHECKPOINT", scale);
+                                status.appendInfo(result, "compressed", "FT_DISK_FLUSH_LEAF_BYTES_FOR_CHECKPOINT", scale);
+                            }
                         }
                     }
-                    {
-                        BSONObjBuilder lwb;
-                        status.appendInfo(lwb, "count", "LTM_LONG_WAIT_ESCALATION_COUNT", false);
-                        status.appendInfo(lwb, "time", "LTM_LONG_WAIT_ESCALATION_TIME", false);
-                        BSONObj lw = lwb.done();
-                        if (!lw.isEmpty()) {
-                            b.append("longWaitEscalation", lw);
-                        }
-                    }
-                    b.doneFast();
                 }
                 {
-                    BSONObjBuilder b(result.subobjStart("compressionRatio"));
-                    status.appendInfo(b, "leaf", "FT_DISK_FLUSH_LEAF_COMPRESSION_RATIO", true);
-                    status.appendInfo(b, "nonleaf", "FT_DISK_FLUSH_NONLEAF_COMPRESSION_RATIO", true);
-                    status.appendInfo(b, "overall", "FT_DISK_FLUSH_OVERALL_COMPRESSION_RATIO", true);
-                    b.doneFast();
+                    NestedBuilder _n1(result, "serializeTime");
+                    {
+                        NestedBuilder _n2(result, "nonleaf");
+                        status.appendInfo(result, "serialize", "FT_NONLEAF_SERIALIZE_TOKUTIME");
+                        status.appendInfo(result, "compress", "FT_NONLEAF_COMPRESS_TOKUTIME");
+                        status.appendInfo(result, "decompress", "FT_NONLEAF_DECOMPRESS_TOKUTIME");
+                        status.appendInfo(result, "deserialize", "FT_NONLEAF_DESERIALIZE_TOKUTIME");
+                    }
+                    {
+                        NestedBuilder _n2(result, "leaf");
+                        status.appendInfo(result, "serialize", "FT_LEAF_SERIALIZE_TOKUTIME");
+                        status.appendInfo(result, "compress", "FT_LEAF_COMPRESS_TOKUTIME");
+                        status.appendInfo(result, "decompress", "FT_LEAF_DECOMPRESS_TOKUTIME");
+                        status.appendInfo(result, "deserialize", "FT_LEAF_DESERIALIZE_TOKUTIME");
+                    }
+                }
+                {
+                    NestedBuilder _n1(result, "locktree");
+                    {
+                        NestedBuilder _n2(result, "size");
+                        status.appendInfo(result, "current", "LTM_SIZE_CURRENT", scale);
+                        status.appendInfo(result, "limit", "LTM_SIZE_LIMIT", scale);
+                    }
+                }
+                {
+                    NestedBuilder _n1(result, "compressionRatio");
+                    status.appendInfo(result, "leaf", "FT_DISK_FLUSH_LEAF_COMPRESSION_RATIO");
+                    status.appendInfo(result, "nonleaf", "FT_DISK_FLUSH_NONLEAF_COMPRESSION_RATIO");
+                    status.appendInfo(result, "overall", "FT_DISK_FLUSH_OVERALL_COMPRESSION_RATIO");
+                }
+                {
+                    NestedBuilder _n1(result, "alerts");
+                    status.appendPanic(result);
+                    status.appendFilesystem(result);
+                    status.appendInfo(result, "locktreeRequestsPending", "LTM_LOCK_REQUESTS_PENDING");
+                    status.appendInfo(result, "checkpointFailures", "CP_CHECKPOINT_COUNT_FAIL");
+                    {
+                        NestedBuilder _n2(result, "longWaitEvents");
+                        status.appendInfo(result, "logBufferWait", "LOGGER_WAIT_BUF_LONG");
+                        {
+                            NestedBuilder _n3(result, "fsync");
+                            status.appendInfo(result, "count", "FS_LONG_FSYNC_COUNT");
+                            status.appendInfo(result, "time", "FS_LONG_FSYNC_TIME");
+                        }
+                        {
+                            NestedBuilder _n3(result, "cachePressure");
+                            status.appendInfo(result, "count", "CT_LONG_WAIT_PRESSURE_COUNT");
+                            status.appendInfo(result, "time", "CT_LONG_WAIT_PRESSURE_TIME");
+                        }
+                        {
+                            NestedBuilder _n3(result, "checkpointBegin");
+                            status.appendInfo(result, "count", "CP_LONG_BEGIN_COUNT");
+                            status.appendInfo(result, "time", "CP_LONG_BEGIN_TIME");
+                        }
+                        {
+                            NestedBuilder _n3(result, "locktreeWait");
+                            status.appendInfo(result, "count", "LTM_LONG_WAIT_COUNT");
+                            status.appendInfo(result, "time", "LTM_LONG_WAIT_TIME");
+                        }
+                        {
+                            NestedBuilder _n3(result, "locktreeWaitEscalation");
+                            status.appendInfo(result, "count", "LTM_LONG_WAIT_ESCALATION_COUNT");
+                            status.appendInfo(result, "time", "LTM_LONG_WAIT_ESCALATION_TIME");
+                        }
+                    }
                 }
 
-                return result.obj();
+                return result.b().obj();
             }
         } essss;
 
@@ -1046,6 +1110,20 @@ namespace mongo {
             }
         } cleanerIterationsParameter;
 
+        class CompressBuffersBeforeEvictionParameter : public ExportedServerParameter<bool> {
+            bool doCompressBuffers;
+          public:
+            CompressBuffersBeforeEvictionParameter() : ExportedServerParameter<bool>(ServerParameterSet::getGlobal(), "compressBuffersBeforeEviction", &doCompressBuffers, true, true) {}
+
+            virtual Status validate(const bool &newVal) {
+                doCompressBuffers = newVal;
+                db_env_set_compress_buffers_before_eviction(doCompressBuffers);
+                return Status::OK();
+            }
+        } compressBuffersBeforeEvictionParameter;
+
+        // These do not need set functions because the ydb uses a callback
+        // to read cmdLine.lockTimeout / cmdLine.loaderMaxMemory 
         ExportedServerParameter<uint64_t> lockTimeoutParameter(ServerParameterSet::getGlobal(), "lockTimeout", &cmdLine.lockTimeout, true, true);
         ExportedServerParameter<BytesQuantity<uint64_t> > loaderMaxMemoryParameter(ServerParameterSet::getGlobal(), "loaderMaxMemory", &cmdLine.loaderMaxMemory, true, true);
 

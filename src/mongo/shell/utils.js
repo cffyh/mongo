@@ -761,7 +761,12 @@ shellHelper.show = function (what) {
     }
 
     if (what == "collections" || what == "tables") {
-        db.getCollectionNames().forEach(function (x) { print(x) });
+        db.forEachCollectionName(function (n) {
+            var c = db.runCommand({collStats : n, scale : 1});
+            var uncompressedSize = c.size + c.totalIndexSize;
+            var compressedSize = c.storageSize + c.totalIndexStorageSize;
+            print(n + "\t" + shellHelper._prettyBytes(uncompressedSize) + " (uncompressed),\t" + shellHelper._prettyBytes(compressedSize) + " (compressed)");
+        });
         return "";
     }
 
@@ -957,6 +962,12 @@ rs.help = function () {
     print("\trs.freeze(secs)                 make a node ineligible to become primary for the time specified");
     print("\trs.remove(hostportstr)          remove a host from the replica set (disconnects)");
     print("\trs.slaveOk()                    shorthand for db.getMongo().setSlaveOk()");
+    print();
+    print("\trs.addPartition()               { replAddPartition : 1 }, add a partition to oplog and oplog.refs");
+    print("\trs.oplogPartitionInfo()         get partition information for oplog collection");
+    print("\trs.oplogRefsPartitionInfo()     get partition information for oplog.refs collection");
+    print("\trs.trimToTS(date)               drop partitions with data preceding date from oplog and oplog.refs");
+    print("\trs.trimToGTID(GTIDBinData)      drop partitions with data preceding GTIDBinData from oplog and oplog.refs");
     print();
     print("\tdb.isMaster()                   check who is primary");
     print("\tdb.printReplicationInfo()       check oplog size and time range");

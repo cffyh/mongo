@@ -1,11 +1,16 @@
 %global product_name tokumx
+%if 0%{?rhel:1}
+%if %{rhel} <= 5
+%define _sharedstatedir /var/lib
+%endif
+%endif
 
 %if 0%{tokumx_enterprise}
 Name: tokumx-enterprise
-Obsoletes: mongo, mongo-10gen, mongo-10gen-unstable, mongo-stable, mongodb, mongodb-server, tokumx
+Obsoletes: mongo, mongodb, mongo-stable, mongo-10gen, mongo-10gen-enterprise, mongo-10gen-unstable, mongo-10gen-unstable-shell, mongo-10gen-unstable-tools, mongodb-org, mongodb-org-shell, mongodb-org-tools, mongodb-org-unstable, mongodb-org-unstable-shell, mongodb-org-unstable-tools, tokumx
 %else
 Name: tokumx
-Obsoletes: mongo, mongo-10gen, mongo-10gen-unstable, mongo-stable, mongodb, mongodb-server
+Obsoletes: mongo, mongodb, mongo-stable, mongo-10gen, mongo-10gen-enterprise, mongo-10gen-unstable, mongo-10gen-unstable-shell, mongo-10gen-unstable-tools, mongodb-org, mongodb-org-shell, mongodb-org-tools, mongodb-org-unstable, mongodb-org-unstable-shell, mongodb-org-unstable-tools
 Conflicts: tokumx-enterprise
 %endif
 Version: %{?tokumx_version}%{!?tokumx_version:1.4.0}
@@ -15,6 +20,7 @@ License: AGPLv3 and zlib and ASL 2.0 and GPLv2
 Vendor: Tokutek, Inc.
 URL: http://www.tokutek.com/products/tokumx-for-mongodb
 Group: Applications/Databases
+BuildRoot: %{buildroot}
 
 Source0: %{name}-%{version}.tar.gz
 Source1: %{product_name}.init
@@ -82,8 +88,9 @@ Requires(preun): chkconfig
 Requires(postun): initscripts
 %endif
 %if 0%{tokumx_enterprise}
-Obsoletes: tokumx-server
+Obsoletes: mongodb-server, mongo-10gen-server, mongo-10gen-unstable-server, mongodb-org-mongos, mongodb-org-server, mongodb-org-unstable-mongos, mongodb-org-unstable-server, tokumx-server
 %else
+Obsoletes: mongodb-server, mongo-10gen-server, mongo-10gen-unstable-server, mongodb-org-mongos, mongodb-org-server, mongodb-org-unstable-mongos, mongodb-org-unstable-server
 Conflicts: tokumx-enterprise-server
 %endif
 
@@ -200,7 +207,11 @@ install -p -dm755 %{buildroot}%{_unitdir}
 install -p -Dm644 %{SOURCE5} %{buildroot}%{_libdir}/../lib/tmpfiles.d/%{product_name}.conf
 install -p -Dm644 %{SOURCE6} %{buildroot}%{_unitdir}/%{product_name}.service
 %else
-install -p -Dm755 %{SOURCE1} $RPM_BUILD_ROOT%{_initddir}/%{product_name}
+%if 0%{?rhel} >= 6
+install -p -Dm755 %{SOURCE1} %{buildroot}%{_initddir}/%{product_name}
+%else
+install -p -Dm755 %{SOURCE1} %{buildroot}%{_initrddir}/%{product_name}
+%endif
 %endif
 
 install -p -Dm644 %{SOURCE2} %{buildroot}%{_sysconfdir}/logrotate.d/%{product_name}
@@ -316,21 +327,12 @@ fi
 %{_mandir}/man1/mongostat.1*
 %{_mandir}/man1/mongotop.1*
 
-%{_datadir}/%{product_name}/scripts/tokumxstat.py*
+%{_datadir}/%{product_name}
 
 %files common
-%doc %{_docdir}/%{product_name}/licenses/GNU-AGPL-3.0
-%doc %{_docdir}/%{product_name}/licenses/README-TOKUKV
-%doc %{_docdir}/%{product_name}/licenses/THIRD-PARTY-NOTICES
-%doc %{_docdir}/%{product_name}/README
-%doc %{_docdir}/%{product_name}/NEWS
 
-%{_libdir}/%{product_name}/libHotBackup.so
-%{_libdir}/%{product_name}/libtokufractaltree.so
-%{_libdir}/%{product_name}/libtokuportability.so
-%if 0%{tokumx_enterprise}
-%{_libdir}/%{product_name}/plugins
-%endif
+%doc %{_docdir}/%{product_name}
+%{_libdir}/%{product_name}
 
 %files -n lib%{name}
 
@@ -338,7 +340,7 @@ fi
 
 %files -n lib%{name}-devel
 
-%{_includedir}
+%{_includedir}/*
 
 %files server
 %{_bindir}/mongod
@@ -355,7 +357,11 @@ fi
 %{_unitdir}/%{product_name}.service
 %{_libdir}/../lib/tmpfiles.d/%{product_name}.conf
 %else
+%if 0%{?rhel} >= 6
 %{_initddir}/%{product_name}
+%else
+%{_initrddir}/%{product_name}
+%endif
 %endif
 
 %changelog

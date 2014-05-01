@@ -69,6 +69,7 @@
 
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/goodies.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/time_support.h"
@@ -808,6 +809,11 @@ namespace mongo {
         return ok;
     }
 
+    // for failure injection around hot indexing
+    MONGO_FP_DECLARE(hotIndexUnlockedBeforeBuild);
+    // a fail point that acts like a condition variable
+    MONGO_FP_DECLARE(hotIndexSleepCond);
+
     static void _buildHotIndex(const char *ns, Message &m, const vector<BSONObj> objs) {
         // We intend to take the DBWrite lock only to initiate and finalize the
         // index build. Since we'll be releasing lock in between these steps, we
@@ -846,7 +852,7 @@ namespace mongo {
             }
 
             _insertObjects(ns, objs, false, 0, true);
-            indexer = cl->newIndexer(info, true);
+            indexer = cl->newHotIndexer(info);
             indexer->prepare();
             addToNamespacesCatalog(IndexDetails::indexNamespace(coll, info["name"].String()));
         }
@@ -869,10 +875,19 @@ namespace mongo {
                 }
             } wlr(lk, ns);
 
+            MONGO_FAIL_POINT_BLOCK(hotIndexUnlockedBeforeBuild, data) {
+                const BSONObj &info = data.getData(); 
+                if (info["sleep"].trueValue()) {
+                    // sleep until the hotIndexSleepCond fail point is active
+                    while (!MONGO_FAIL_POINT(hotIndexSleepCond)) {
+                        sleep(1);
+                    }
+                }
+            }
+
             // Perform the index build
             indexer->build();
         }
-
 
         // Commit the index build
         {
@@ -927,10 +942,10 @@ namespace mongo {
         settings.setQueryCursorMode(WRITE_LOCK_CURSOR);
         cc().setOpSettings(settings);
 
-        if (coll == "system.indexes" &&
-                // Can only build non-unique indexes in the background, because the
-                // hot indexer does not know how to perform unique checks.
-                objs[0]["background"].trueValue() && !objs[0]["unique"].trueValue()) {
+        if (coll == "system.indexes" && objs[0]["background"].trueValue()) {
+            // Can only build non-unique indexes in the background, because the
+            // hot indexer does not know how to perform unique checks.
+            uassert(17330, "cannot build unique indexes in the background, change to a foreground index or remove the unique constraint", !objs[0]["unique"].trueValue());
             _buildHotIndex(ns, m, objs);
             return;
         }
@@ -971,7 +986,7 @@ namespace mongo {
                 e->names.push_back(string((char *) key->data, length - 3));
             }
         }
-        return 0;
+        return TOKUDB_CURSOR_CONTINUE;
     } 
 
     void getDatabaseNames( vector< string > &names) {
